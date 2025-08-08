@@ -1,0 +1,130 @@
+
+.env
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+
+
+# Virtual environments
+venv/
+.venv/
+ENV/
+env/
+.env/
+env.bak/
+venv.bak/
+.env
+# PyInstaller
+*.manifest
+*.spec
+
+# MyPy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Pyre type checker
+.pyre/
+
+# Pytype
+.pytype/
+
+# Cython debug symbols
+cython_debug/
+
+# VSCode settings
+.vscode/
+
+# PyCharm settings
+.idea/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# dotenv
+*.env
+.env.*
+
+# macOS
+.DS_Store
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Logs
+*.log
+
+# Test & Coverage
+.coverage
+.tox/
+.nox/
+.cache/
+pytest_cache/
+coverage.xml
+htmlcov/
+
+# Ruff cache
+ruff_cache/
+
+# Temporary files
+*.bak
+*.swp
+*.tmp
+
+# Gradio temp
+gradio_cached_examples/
+
+# Sound / audio cache (e.g., from pyttsx3, whisper, pydub, etc.)
+*.wav
+*.mp3
+*.flac
+*.aiff
+*.ogg
+
+# Ignore compiled models
+*.pt
+*.pth
+
+# Ignore data artifacts
+*.csv
+*.tsv
+*.json
+*.parquet
+*.xlsx
+*.xls
+
+# Ignore Whisper temp files
+whisper_tmp/
+
+
+#
+.pickle
+.credentals.json

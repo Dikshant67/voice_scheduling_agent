@@ -1,0 +1,255 @@
+import os
+import pickle
+from datetime import datetime, timedelta
+
+from google_auth_oauthlib.flow import InstalledAppFlow
+from googleapiclient.discovery import build
+from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
+import pytz
+from core.validation import is_valid_date, is_valid_time
+from core.timezone_utils import parse_datetime, validate_timezone
+
+class CalendarService:
+    def __init__(self):
+        self.SCOPES = ['https://www.googleapis.com/auth/calendar']
+        self.token_path = 'token.pickle'
+        self.BUFFER_MINUTES = 15
+        self.DEFAULT_MEETING_DURATION = 60  # in minutes
+        self.credentials = self._get_credentials()
+
+    def _get_credentials(self):
+        try:
+            flow = InstalledAppFlow.from_client_secrets_file('./credentials.json', self.SCOPES)
+            creds = flow.run_local_server(port=0)
+            with open(self.token_path, 'wb') as token:
+                pickle.dump(creds, token)
+            return creds
+        except Exception as e:
+            raise Exception(f"Authentication failed: {str(e)}")
+
+    def fetch_existing_events(self, start_dt, end_dt, timezone='Asia/Kolkata'):
+        """
+        Fetch existing events from Google Calendar within the specified date range,
+        returning titles and times converted to the specified timezone.
+        
+        Args:
+            start_dt (datetime): Start of the date range (timezone-aware or UTC)
+            end_dt (datetime): End of the date range (timezone-aware or UTC)
+            timezone (str): Target timezone for event times (default: Asia/Kolkata)
+        
+        Returns:
+            list: List of dictionaries containing event title, start, and end times
+        """
+        try:
+            # Validate inputs
+            if not isinstance(start_dt, datetime) or not isinstance(end_dt, datetime):
+                raise ValueError("start_dt and end_dt must be datetime objects")
+            validate_timezone(timezone)
+            tz = pytz.timezone(timezone)
+
+            # Ensure start_dt and end_dt are timezone-aware
+            if start_dt.tzinfo is None:
+                start_dt = start_dt.replace(tzinfo=pytz.UTC)
+            if end_dt.tzinfo is None:
+                end_dt = end_dt.replace(tzinfo=pytz.UTC)
+
+            # Build Google Calendar service
+            service = build('calendar', 'v3', credentials=self.credentials)
+            
+            # Fetch events
+            events_result = service.events().list(
+                calendarId='primary',
+                timeMin=start_dt.isoformat(),
+                timeMax=end_dt.isoformat(),
+                singleEvents=True,
+                orderBy='startTime',
+                fields="items(summary,start(dateTime),end(dateTime))"  # Explicitly include summary, start, end
+            ).execute()
+
+            events = events_result.get('items', [])
+            formatted_events = []
+
+            # Process each event
+            for event in events:
+                title = event.get('summary', 'Untitled Event')  # Default to 'Untitled Event' if no summary
+                start_str = event.get('start', {}).get('dateTime')
+                end_str = event.get('end', {}).get('dateTime')
+
+                if start_str and end_str:
+                    try:
+                        # Parse event times and convert to target timezone
+                        start_dt = datetime.fromisoformat(start_str).astimezone(tz)
+                        end_dt = datetime.fromisoformat(end_str).astimezone(tz)
+                        
+                        formatted_events.append({
+                            'title': title,
+                            'start': start_dt.strftime("%Y-%m-%d %H:%M:%S %Z"),
+                            'end': end_dt.strftime("%Y-%m-%d %H:%M:%S %Z")
+                        })
+                    except ValueError as e:
+                        print(f"Skipping event '{title}' due to invalid date format: {str(e)}")
+                        continue
+
+            return formatted_events
+
+        except Exception as e:
+            raise Exception(f"Error fetching events: {str(e)}")
+        finally:
+            # Delete token file
+            if os.path.exists(self.token_path):
+                os.remove(self.token_path)
+                print("🗑️ Token file deleted.")
+
+    def has_conflict_with_buffer(self, existing_events, new_start, new_end):
+        for event in existing_events:
+            start = event['start'].get('dateTime')
+            end = event['end'].get('dateTime')
+
+            if start and end:
+                existing_start = datetime.fromisoformat(start)
+                existing_end = datetime.fromisoformat(end)
+
+                if existing_start.tzinfo is None or existing_end.tzinfo is None:
+                    raise ValueError("Existing event times must be timezone-aware")
+
+                if not (new_end <= existing_start - timedelta(minutes=self.BUFFER_MINUTES) or
+                        new_start >= existing_end + timedelta(minutes=self.BUFFER_MINUTES)):
+                    return True
+        return False
+
+    def suggest_next_slot(self, existing_events, desired_start, duration_minutes):
+        current = desired_start
+        for event in sorted(existing_events, key=lambda e: e['start'].get('dateTime')):
+            start_str = event['start'].get('dateTime')
+            end_str = event['end'].get('dateTime')
+
+            if start_str and end_str:
+                existing_start = datetime.fromisoformat(start_str)
+                existing_end = datetime.fromisoformat(end_str)
+
+                if existing_start.tzinfo is None or existing_end.tzinfo is None:
+                    raise ValueError("Existing event times must be timezone-aware")
+
+                if current + timedelta(minutes=duration_minutes) <= existing_start - timedelta(minutes=self.BUFFER_MINUTES):
+                    return current
+
+                current = max(current, existing_end + timedelta(minutes=self.BUFFER_MINUTES))
+
+        return current
+
+    def schedule_event(self, title, start_dt, end_dt, timezone, attendees=None):
+        service = build('calendar', 'v3', credentials=self.credentials)
+        try:
+            tz = validate_timezone(timezone)
+            event = {
+                'summary': title,
+                'start': {'dateTime': start_dt.isoformat(), 'timeZone': timezone},
+                'end': {'dateTime': end_dt.isoformat(), 'timeZone': timezone},
+            }
+            if attendees:
+                event['attendees'] = [{'email': email} for email in attendees]
+            created_event = service.events().insert(calendarId='primary', body=event).execute()
+            return created_event.get('htmlLink')
+        finally:
+            if os.path.exists(self.token_path):
+                os.remove(self.token_path)
+            print("🗑️ Token file deleted.")
+
+    def intelligent_schedule_handler(self, gpt_data):
+        title = gpt_data.get('title')
+        date_str = gpt_data.get('date')
+        time_str = gpt_data.get('time')
+        timezone = gpt_data.get('timezone', 'UTC')
+        attendees = gpt_data.get('attendees', [])
+
+        missing_fields = []
+
+        if not title or not title.strip():
+            missing_fields.append("title")
+        if not date_str or not is_valid_date(date_str):
+            missing_fields.append("date")
+        if not time_str or not is_valid_time(time_str):
+            missing_fields.append("time")
+        try:
+            validate_timezone(timezone)
+        except ValueError:
+            missing_fields.append("timezone")
+
+        if missing_fields:
+            return {
+                'status': 'missing_info',
+                'missing': missing_fields,
+                'message': f"Missing or invalid fields: {', '.join(missing_fields)}"
+            }
+
+        try:
+            tz = pytz.timezone(timezone)
+            start_dt = tz.localize(datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M"))
+            end_dt = start_dt + timedelta(minutes=self.DEFAULT_MEETING_DURATION)
+        except Exception as e:
+            return {
+                'status': 'error',
+                'message': f"Invalid date/time format: {str(e)}"
+            }
+
+        check_start = start_dt - timedelta(minutes=self.BUFFER_MINUTES)
+        check_end = end_dt + timedelta(minutes=self.BUFFER_MINUTES)
+        existing_events = self.fetch_existing_events(check_start, check_end)
+
+        if self.has_conflict_with_buffer(existing_events, start_dt, end_dt):
+            suggested_start = self.suggest_next_slot(existing_events, start_dt, self.DEFAULT_MEETING_DURATION)
+            suggested_end = suggested_start + timedelta(minutes=self.DEFAULT_MEETING_DURATION)
+
+            return {
+                'status': 'conflict',
+                'message': 'Conflicting schedule',
+                'suggested_start': suggested_start.strftime("%Y-%m-%d %H:%M"),
+                'suggested_end': suggested_end.strftime("%Y-%m-%d %H:%M"),
+                'timezone': timezone
+            }
+
+        meeting_link = self.schedule_event(title, start_dt, end_dt, timezone, attendees)
+        return {
+            'status': 'scheduled',
+            'start': start_dt.strftime("%Y-%m-%d %H:%M"),
+            'end': end_dt.strftime("%Y-%m-%d %H:%M"),
+            'timezone': timezone,
+            'link': meeting_link
+        }
+
+    # def get_availability(self, start: str, end: str, timezone: str):
+    #     try:
+    #         validate_timezone(timezone)
+    #         start_dt = parse_datetime(start)
+    #         end_dt = parse_datetime(end)
+    #         events = self.fetch_existing_events(start_dt, end_dt)
+    #         tz = pytz.timezone(timezone)
+    #         return [{
+    #             'start': datetime.fromisoformat(event['start']['dateTime']).astimezone(tz).isoformat(),
+    #             'end': datetime.fromisoformat(event['end']['dateTime']).astimezone(tz).isoformat()
+    #         } for event in events]
+    #     except ValueError as e:
+    #         raise ValueError(f"Invalid timezone or date format: {str(e)}")
+    #     finally:
+    #         if os.path.exists(self.token_path):
+    #             os.remove(self.token_path)
+    #             print("🗑️ Token file deleted.")
+    def get_availability(self, start: str, end: str, timezone: str):
+        try:
+            validate_timezone(timezone)
+            start_dt = parse_datetime(start)
+            end_dt = parse_datetime(end)
+            events = self.fetch_existing_events(start_dt, end_dt, timezone)
+            tz = pytz.timezone(timezone)
+            return [{
+            'start':  datetime.fromisoformat(event['start']).astimezone(tz).isoformat(),
+            'end':  datetime.fromisoformat(event['end']).astimezone(tz).isoformat(),
+            'title': event['title']
+        } for event in events]
+        except ValueError as e:
+            raise ValueError(f"Invalid timezone or date format: {str(e)}")
+        finally:
+            if os.path.exists(self.token_path):
+                os.remove(self.token_path)
+            print("🗑️ Token file deleted.")
