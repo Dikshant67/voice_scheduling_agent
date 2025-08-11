@@ -1,5 +1,4 @@
 "use client";
-
 import { useState, useEffect } from "react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -24,16 +23,30 @@ import {
   Globe,
   Volume2,
   Sparkles,
+  Loader2,
 } from "lucide-react";
+import { useRouter } from "next/navigation";
+import { toast } from "sonner";
 import GoogleLoginButton from "@/components/ui/google_login_button";
 
 interface Meeting {
-  id: string;
   title: string;
   time: string;
-  date?: string; // Optional date field
-  status: "scheduled" | "canceled";
+  status: string;
+  date: string;
   participants: number;
+  description: string;
+  location: string;
+  attendees: Array<{ email: string; responseStatus: string }>;
+  organizer: string;
+  creator: string;
+  created: string;
+  updated: string;
+  htmlLink: string;
+  hangoutLink: string;
+  recurrence: string[];
+  recurringEventId: string;
+  endTime: string;
 }
 
 interface VoiceCommand {
@@ -42,14 +55,18 @@ interface VoiceCommand {
 }
 
 export default function ScheduleVoiceFramework() {
+  const router = useRouter();
   const [isRecording, setIsRecording] = useState(false);
   const [selectedVoice, setSelectedVoice] = useState("en-IN-NeerjaNeural");
   const [selectedTimezone, setSelectedTimezone] = useState("UTC");
   const [transcription, setTranscription] = useState("");
   const [meetings, setMeetings] = useState<Meeting[]>([]);
   const [ws, setWs] = useState<WebSocket | null>(null);
-  const [mediaRecorder, setMediaRecorder] = useState<MediaRecorder | null>(null);
+  const [mediaRecorder, setMediaRecorder] = useState<MediaRecorder | null>(
+    null
+  );
   const [mediaStream, setMediaStream] = useState<MediaStream | null>(null);
+  const [isLoadingMeetings, setIsLoadingMeetings] = useState(false);
 
   const voiceCommands: VoiceCommand[] = [
     { command: "Schedule meeting", description: "Create a new meeting" },
@@ -74,253 +91,211 @@ export default function ScheduleVoiceFramework() {
   ];
 
   useEffect(() => {
-    // Set timezone client-side
-    setSelectedTimezone(Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC");
+    // Set user's actual timezone
+    const userTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    setSelectedTimezone(userTimezone || "UTC");
 
-    // Fetch availability
-    const fetchAvailability = async () => {
-      try {
-        const start = new Date().toISOString();
-        const end = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
-        const response = await fetch(
-          `http://localhost:8000/calendar/availability?start=${start}&end=${end}&timezone=${selectedTimezone}`
-        );
-        const data = await response.json();
-        if (data.availability) {
-          setMeetings(
-            data.availability.map((event: any, index: number) => ({
-              id: `${index}-${event.start}`,
-              title: event.summary || "Unnamed Meeting",
-              time: event.start.split("T")[1].slice(0, 5),
-              status: "scheduled",
-              date: event.start.split("T")[0],
-              participants: event.attendees?.length || 1,
-            }))
-          );
-        }
-      } catch (error) {
-        setTranscription(`Error fetching availability: ${error}`);
-      }
-    };
+    // Load meetings
     fetchAvailability();
-
-    // Cleanup WebSocket, recorder, and media stream
-    return () => {
-      if (ws) ws.close();
-      if (mediaRecorder && mediaRecorder.state !== "inactive") {
-        mediaRecorder.stop();
-      }
-      if (mediaStream) {
-        mediaStream.getTracks().forEach((track) => track.stop());
-      }
-    };
   }, [selectedTimezone]);
 
-  // const toggleRecording = async () => {
-  //   if (!isRecording) {
-  //     // Start recording
-  //     try {
-  //       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-  //       setMediaStream(stream); // Store the stream for cleanup
-  //       const recorder = new MediaRecorder(stream);
-  //       setMediaRecorder(recorder);
-  //       const audioChunks: Blob[] = [];
-
-  //       recorder.ondataavailable = (event) => {
-  //         audioChunks.push(event.data);
-  //       };
-
-  //       recorder.onstop = async () => {
-  //         const audioBlob = new Blob(audioChunks, { type: "audio/wav" });
-  //         const arrayBuffer = await audioBlob.arrayBuffer();
-  //         const audioHex = Array.from(new Uint8Array(arrayBuffer))
-  //           .map((b) => b.toString(16).padStart(2, "0"))
-  //           .join("");
-
-  //         const websocket = new WebSocket("ws://localhost:8000/ws/voice");
-  //         setWs(websocket);
-
-  //         websocket.onopen = () => {
-  //           websocket.send(
-  //             JSON.stringify({
-  //               audio: audioHex,
-  //               timezone: selectedTimezone,
-  //             })
-  //           );
-  //         };
-
-  //         websocket.onmessage = (event) => {
-  //           const data = JSON.parse(event.data);
-  //           if (data.error) {
-  //             setTranscription(`Error: ${data.error}`);
-  //           } else if (data.status === "scheduled") {
-  //             setTranscription(
-  //               `Meeting scheduled: ${data.event.start} (${selectedTimezone})`
-  //             );
-  //             setMeetings((prev) => [
-  //               ...prev,
-  //               {
-  //                 id: data.event.link || `meeting-${Date.now()}-${prev.length}`,
-  //                 title: data.event.summary || "New Meeting",
-  //                 time: data.event.start.split(" ")[1],
-  //                 status: "scheduled",
-  //                 participants: data.event.attendees?.length || 1,
-  //               },
-  //             ]);
-  //           } else if (data.status === "conflict") {
-  //             setTranscription(
-  //               `${data.event.message}. Suggested: ${data.event.suggested_start} (${selectedTimezone})`
-  //             );
-  //           } else if (data.status === "missing_info") {
-  //             setTranscription(data.event.message);
-  //           }
-
-  //           if (data.audio) {
-  //             const audioBytes = new Uint8Array(
-  //               data.audio.match(/.{1,2}/g).map((byte: string) => parseInt(byte, 16))
-  //             );
-  //             const audioBlob = new Blob([audioBytes], { type: "audio/wav" });
-  //             const audioUrl = URL.createObjectURL(audioBlob);
-  //             const audio = new Audio(audioUrl);
-  //             audio.play();
-  //           }
-  //         };
-
-  //         websocket.onerror = () => {
-  //           setTranscription("WebSocket error. Please try again.");
-  //           setIsRecording(false);
-  //         };
-
-  //         websocket.onclose = () => {
-  //           setWs(null);
-  //         };
-  //       };
-
-  //       recorder.start();
-  //       setIsRecording(true);
-  //       setTranscription("Listening...");
-  //     } catch (error) {
-  //       setTranscription(`Error accessing microphone: ${error}`);
-  //       setIsRecording(false);
-  //     }
-  //   } else {
-  //     // Stop recording
-  //     if (mediaRecorder && mediaRecorder.state !== "inactive") {
-  //       mediaRecorder.stop();
-  //     }
-  //     if (mediaStream) {
-  //       mediaStream.getTracks().forEach((track) => track.stop());
-  //     }
-  //     if (ws) {
-  //       ws.close();
-  //     }
-  //     setMediaRecorder(null);
-  //     setMediaStream(null);
-  //     setWs(null);
-  //     setIsRecording(false);
-  //     setTranscription("Recording stopped.");
-  //   }
-  // };
-const toggleRecording = async () => {
-  if (!isRecording) {
+  const fetchAvailability = async () => {
+    setIsLoadingMeetings(true);
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      const recorder = new MediaRecorder(stream);
-      setMediaRecorder(recorder);
-      const audioChunks: Blob[] = [];
+      const start = new Date().toISOString();
+      const end = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
 
-      recorder.ondataavailable = (event) => {
-        audioChunks.push(event.data);
-      };
+      const response = await fetch(
+        `http://localhost:8000/calendar/availability?start=${start}&end=${end}&timezone=${selectedTimezone}`
+      );
 
-      recorder.onstop = async () => {
-        const audioBlob = new Blob(audioChunks, { type: "audio/wav" });
-        const arrayBuffer = await audioBlob.arrayBuffer();
-        const audioHex = Array.from(new Uint8Array(arrayBuffer))
-          .map((b) => b.toString(16).padStart(2, "0"))
-          .join("");
+      if (!response.ok) {
+        throw new Error(`HTTP error: ${response.status}`);
+      }
 
-        const websocket = new WebSocket("ws://localhost:8000/ws/voice");
-        setWs(websocket);
+      const data = await response.json();
 
-        websocket.onopen = () => {
-          websocket.send(
-            JSON.stringify({
-              audio: audioHex,
-              timezone: selectedTimezone,
-            })
-          );
-        };
-
-        websocket.onmessage = (event) => {
-          const data = JSON.parse(event.data);
-          if (data.error) {
-            setTranscription(`Error: ${data.error}`);
-          } else if (data.status === "scheduled") {
-            setTranscription(`Meeting scheduled: ${data.event.start} (${selectedTimezone})`);
-            setMeetings((prev) => [
-              ...prev,
-              {
-                id: data.event.link || `meeting-${Date.now()}-${prev.length}`,
-                title: data.event.summary || "New Meeting",
-                time: data.event.start.split(" ")[1],
-                status: "scheduled",
-                participants: data.event.attendees?.length || 1,
-              },
-            ]);
-          } else if (data.status === "conflict") {
-            setTranscription(
-              `${data.event.message}. Suggested: ${data.event.suggested_start} (${selectedTimezone})`
-            );
-          } else if (data.status === "missing_info") {
-            setTranscription(data.event.message);
-          }
-
-          if (data.audio) {
-            const audioBytes = new Uint8Array(
-              data.audio.match(/.{1,2}/g).map((byte: string) => parseInt(byte, 16))
-            );
-            const audioBlob = new Blob([audioBytes], { type: "audio/wav" });
-            const audioUrl = URL.createObjectURL(audioBlob);
-            const audio = new Audio(audioUrl);
-            audio.play();
-          }
-        };
-
-        websocket.onerror = () => {
-          setTranscription("WebSocket error. Please try again.");
-          setIsRecording(false);
-        };
-
-        websocket.onclose = () => {
-          setWs(null);
-        };
-      };
-
-      recorder.start();
-      setIsRecording(true);
-      setTranscription("Listening...");
+      if (data.availability) {
+        setMeetings(
+          data.availability.map((event: any) => ({
+            title: event.title || "Scheduled Meeting",
+            time: event.start.split("T")[1]?.slice(0, 5) || "00:00",
+            status: event.status || "scheduled",
+            date: event.start.split("T")[0],
+            participants: event.attendees?.length + 1 || 1,
+            description: event.description || "",
+            location: event.location || "",
+            attendees: event.attendees || [],
+            organizer: event.organizer || "",
+            creator: event.creator || "",
+            created: event.created || "",
+            updated: event.updated || "",
+            htmlLink: event.htmlLink || "",
+            hangoutLink: event.hangoutLink || "",
+            recurrence: event.recurrence || [],
+            recurringEventId: event.recurringEventId || "",
+            endTime: event.end.split("T")[1]?.slice(0, 5) || "00:00",
+          }))
+        );
+      }
     } catch (error) {
-      setTranscription(`Error: ${error}`);
-      setIsRecording(false);
+      console.error("Fetch error:", error);
+      toast.error("Failed to load meetings");
+    } finally {
+      setIsLoadingMeetings(false);
     }
-  } else {
-    // Stop recording
-    if (mediaRecorder) {
-      const stream = mediaRecorder.stream;
-      mediaRecorder.stop();
+  };
 
-      // 🛑 Stop all tracks (important!)
-      stream.getTracks().forEach((track) => track.stop());
+  const toggleRecording = async () => {
+    if (!isRecording) {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          audio: true,
+        });
+        setMediaStream(stream);
+        const recorder = new MediaRecorder(stream);
+        setMediaRecorder(recorder);
+        const audioChunks: Blob[] = [];
+
+        recorder.ondataavailable = (event) => {
+          audioChunks.push(event.data);
+        };
+
+        recorder.onstop = async () => {
+          const audioBlob = new Blob(audioChunks, { type: "audio/wav" });
+          const arrayBuffer = await audioBlob.arrayBuffer();
+          const audioHex = Array.from(new Uint8Array(arrayBuffer))
+            .map((b) => b.toString(16).padStart(2, "0"))
+            .join("");
+
+          const websocket = new WebSocket("ws://localhost:8000/ws/voice");
+          setWs(websocket);
+
+          websocket.onopen = () => {
+            websocket.send(
+              JSON.stringify({
+                audio: audioHex,
+                timezone: selectedTimezone,
+              })
+            );
+          };
+
+          websocket.onmessage = (event) => {
+            const data = JSON.parse(event.data);
+            if (data.error) {
+              setTranscription(`Error: ${data.message || data.error}`);
+              toast.error(data.message || "Voice command failed");
+            } else if (data.status === "scheduled") {
+              setTranscription(
+                `Meeting scheduled: ${data.event.title} at ${
+                  data.event.start
+                } (${selectedTimezone})${
+                  data.event.location ? ` at ${data.event.location}` : ""
+                }`
+              );
+              toast.success("Meeting scheduled successfully");
+              setMeetings((prev) => [...prev, formatMeeting(data.event)]);
+            } else if (data.status === "conflict") {
+              setTranscription(
+                `${data.event.message}. Suggested: ${data.event.suggested_start} to ${data.event.suggested_end} (${selectedTimezone})`
+              );
+              toast.warning("Scheduling conflict detected");
+            } else if (data.status === "missing_info") {
+              setTranscription(data.event.message);
+              toast.info("Additional information needed");
+            }
+
+            if (data.audio) {
+              playAudioResponse(data.audio);
+            }
+          };
+
+          websocket.onerror = () => {
+            setTranscription("Connection error. Please try again.");
+            toast.error("Voice connection failed");
+            setIsRecording(false);
+          };
+
+          websocket.onclose = () => {
+            setWs(null);
+          };
+        };
+
+        recorder.start();
+        setIsRecording(true);
+        setTranscription("Listening...");
+        toast.info("Listening for voice commands...");
+      } catch (error) {
+        console.error("Microphone error:", error);
+        setTranscription(`Error accessing microphone: ${error}`);
+        toast.error("Microphone access denied");
+        setIsRecording(false);
+      }
+    } else {
+      stopRecording();
+    }
+  };
+
+  const stopRecording = () => {
+    if (mediaRecorder && mediaRecorder.state !== "inactive") {
+      mediaRecorder.stop();
+    }
+    if (mediaStream) {
+      mediaStream.getTracks().forEach((track) => track.stop());
+    }
+    if (ws) {
+      ws.close();
     }
     setIsRecording(false);
     setMediaRecorder(null);
-  }
-};
+    setMediaStream(null);
+    setWs(null);
+    setTranscription("Recording stopped.");
+  };
+
+  const formatMeeting = (event: any): Meeting => ({
+    title: event.title || "Scheduled Meeting",
+    time: event.start.split("T")[1]?.slice(0, 5) || "00:00",
+    status: event.status || "scheduled",
+    date: event.start.split("T")[0],
+    participants: event.attendees?.length + 1 || 1,
+    description: event.description || "",
+    location: event.location || "",
+    attendees: event.attendees || [],
+    organizer: event.organizer || "",
+    creator: event.creator || "",
+    created: event.created || "",
+    updated: event.updated || "",
+    htmlLink: event.htmlLink || "",
+    hangoutLink: event.hangoutLink || "",
+    recurrence: event.recurrence || [],
+    recurringEventId: event.recurringEventId || "",
+    endTime: event.end.split("T")[1]?.slice(0, 5) || "00:00",
+  });
+
+  const playAudioResponse = (audioHex: string) => {
+    try {
+      const audioBytes = new Uint8Array(
+        audioHex.match(/.{1,2}/g)?.map((byte) => parseInt(byte, 16)) || []
+      );
+      const audioBlob = new Blob([audioBytes], { type: "audio/wav" });
+      const audioUrl = URL.createObjectURL(audioBlob);
+      const audio = new Audio(audioUrl);
+      audio.play().catch((err) => console.error("Audio playback error:", err));
+    } catch (error) {
+      console.error("Audio processing error:", error);
+    }
+  };
+
+  // Clean up on unmount
+  useEffect(() => {
+    return () => {
+      stopRecording();
+    };
+  }, []);
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-slate-50 via-blue-50 to-indigo-50">
-      {/* Header */}
       <header className="border-b border-slate-200 bg-white/80 backdrop-blur-sm sticky top-0 z-50">
         <div className="container mx-auto px-6 py-4">
           <div className="flex items-center justify-between">
@@ -337,20 +312,14 @@ const toggleRecording = async () => {
                 </p>
               </div>
             </div>
-
-            <GoogleLoginButton
-              className="bg-white border border-slate-200 text-slate-700 hover:bg-slate-50 hover:border-slate-300 transition-all duration-300 shadow-sm hover:shadow-md"
-              size="lg" children={undefined}            >
-            </GoogleLoginButton>
+            <GoogleLoginButton> </GoogleLoginButton>
           </div>
         </div>
       </header>
 
       <div className="container mx-auto px-6 py-8">
         <div className="grid lg:grid-cols-3 gap-8">
-          {/* Voice Control Panel */}
           <div className="lg:col-span-2 space-y-6">
-            {/* Main Voice Interface */}
             <Card className="border-0 shadow-xl bg-white/70 backdrop-blur-sm hover:shadow-2xl transition-all duration-500">
               <CardHeader className="text-center pb-6">
                 <CardTitle className="text-2xl font-semibold text-slate-800">
@@ -361,7 +330,6 @@ const toggleRecording = async () => {
                 </p>
               </CardHeader>
               <CardContent className="space-y-8">
-                {/* Microphone */}
                 <div className="flex justify-center">
                   <div className="relative">
                     <Button
@@ -379,8 +347,6 @@ const toggleRecording = async () => {
                         <Mic className="w-8 h-8 text-white" />
                       )}
                     </Button>
-
-                    {/* Waving Effect */}
                     {isRecording && (
                       <>
                         <div className="absolute inset-0 rounded-full border-4 border-red-400 animate-ping opacity-75"></div>
@@ -390,8 +356,6 @@ const toggleRecording = async () => {
                     )}
                   </div>
                 </div>
-
-                {/* Controls */}
                 <div className="grid md:grid-cols-3 gap-4">
                   <div className="space-y-2">
                     <label className="text-sm font-medium text-slate-700 flex items-center gap-2">
@@ -414,7 +378,6 @@ const toggleRecording = async () => {
                       </SelectContent>
                     </Select>
                   </div>
-
                   <div className="space-y-2">
                     <label className="text-sm font-medium text-slate-700 flex items-center gap-2">
                       <Globe className="w-4 h-4" />
@@ -439,7 +402,6 @@ const toggleRecording = async () => {
                       </SelectContent>
                     </Select>
                   </div>
-
                   <div className="space-y-2">
                     <label className="text-sm font-medium text-slate-700">
                       Status
@@ -455,8 +417,6 @@ const toggleRecording = async () => {
                     </div>
                   </div>
                 </div>
-
-                {/* Live Transcription */}
                 <div className="space-y-3">
                   <label className="text-sm font-medium text-slate-700">
                     Live Transcription
@@ -476,8 +436,6 @@ const toggleRecording = async () => {
                 </div>
               </CardContent>
             </Card>
-
-            {/* Voice Commands Reference */}
             <Card className="border-0 shadow-lg bg-white/70 backdrop-blur-sm hover:shadow-xl transition-all duration-300">
               <CardHeader>
                 <CardTitle className="text-lg font-semibold text-slate-800 flex items-center gap-2">
@@ -504,8 +462,6 @@ const toggleRecording = async () => {
               </CardContent>
             </Card>
           </div>
-
-          {/* Meeting Summary Sidebar */}
           <div className="space-y-6">
             <Card className="border-0 shadow-lg bg-white/70 backdrop-blur-sm hover:shadow-xl transition-all duration-300">
               <CardHeader>
@@ -517,14 +473,14 @@ const toggleRecording = async () => {
               <CardContent>
                 <ScrollArea className="h-[400px]">
                   <div className="space-y-4">
-                    {meetings.map((meeting) => (
+                    {meetings.map((meeting, index) => (
                       <div
-                        key={meeting.id}
+                        key={`${meeting.date}-${meeting.time}-${index}`}
                         className="p-4 rounded-lg border border-slate-200 hover:border-slate-300 transition-all duration-200 hover:shadow-md bg-white/50"
                       >
                         <div className="flex items-start justify-between mb-2">
                           <h4 className="font-medium text-slate-800">
-                            {meeting.title}
+                            {meeting.title || "Scheduled Meeting"}
                             {meeting.date && (
                               <span className="text-sm text-slate-500 ml-2">
                                 ({meeting.date})
@@ -533,17 +489,17 @@ const toggleRecording = async () => {
                           </h4>
                           <Badge
                             variant={
-                              meeting.status === "scheduled"
+                              meeting.status === "confirmed"
                                 ? "default"
                                 : "destructive"
                             }
                             className={`${
-                              meeting.status === "scheduled"
+                              meeting.status === "confirmed"
                                 ? "bg-green-100 text-green-800 hover:bg-green-200"
                                 : "bg-red-100 text-red-800 hover:bg-red-200"
                             } transition-colors`}
                           >
-                            {meeting.status === "scheduled" ? (
+                            {meeting.status === "confirmed" ? (
                               <CheckCircle className="w-3 h-3 mr-1" />
                             ) : (
                               <XCircle className="w-3 h-3 mr-1" />
@@ -554,21 +510,29 @@ const toggleRecording = async () => {
                         <div className="flex items-center gap-4 text-sm text-slate-600">
                           <div className="flex items-center gap-1">
                             <Clock className="w-4 h-4" />
-                            {meeting.time}
+                            {meeting.time} - {meeting.endTime}
                           </div>
                           <div className="flex items-center gap-1">
                             <Users className="w-4 h-4" />
                             {meeting.participants}
                           </div>
                         </div>
+                        {meeting.location && (
+                          <div className="text-sm text-slate-600 mt-1">
+                            Location: {meeting.location}
+                          </div>
+                        )}
+                        {meeting.description && (
+                          <div className="text-sm text-slate-600 mt-1">
+                            Description: {meeting.description}
+                          </div>
+                        )}
                       </div>
                     ))}
                   </div>
                 </ScrollArea>
               </CardContent>
             </Card>
-
-            {/* Quick Stats */}
             <Card className="border-0 shadow-lg bg-white/70 backdrop-blur-sm hover:shadow-xl transition-all duration-300">
               <CardHeader>
                 <CardTitle className="text-lg font-semibold text-slate-800">
@@ -585,9 +549,9 @@ const toggleRecording = async () => {
                   </div>
                   <Separator />
                   <div className="flex justify-between items-center">
-                    <span className="text-slate-600">Canceled Today</span>
+                    <span className="text-slate-600">Cancelled Today</span>
                     <span className="font-semibold text-red-600">
-                      {meetings.filter((m) => m.status === "canceled").length}
+                      {meetings.filter((m) => m.status === "cancelled").length}
                     </span>
                   </div>
                   <Separator />
