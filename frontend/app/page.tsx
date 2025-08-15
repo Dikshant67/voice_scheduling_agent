@@ -1,5 +1,5 @@
 "use client";
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import {
@@ -61,11 +61,10 @@ export default function ScheduleVoiceFramework() {
   const [selectedTimezone, setSelectedTimezone] = useState("UTC");
   const [transcription, setTranscription] = useState("");
   const [meetings, setMeetings] = useState<Meeting[]>([]);
-  const [ws, setWs] = useState<WebSocket | null>(null);
-  const [mediaRecorder, setMediaRecorder] = useState<MediaRecorder | null>(
-    null
-  );
-  const [mediaStream, setMediaStream] = useState<MediaStream | null>(null);
+const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+const mediaStreamRef = useRef<MediaStream | null>(null);
+const wsRef = useRef<WebSocket | null>(null);
+
   const [isLoadingMeetings, setIsLoadingMeetings] = useState(false);
 
   const voiceCommands: VoiceCommand[] = [
@@ -145,42 +144,126 @@ export default function ScheduleVoiceFramework() {
       setIsLoadingMeetings(false);
     }
   };
+  
 
-  const toggleRecording = async () => {
-    if (!isRecording) {
-      try {
-        const stream = await navigator.mediaDevices.getUserMedia({
-          audio: true,
-        });
-        setMediaStream(stream);
-        const recorder = new MediaRecorder(stream);
-        setMediaRecorder(recorder);
-        const audioChunks: Blob[] = [];
+
+  // const toggleRecording = async () => {
+  //   if (!isRecording) {
+  //     try {
+  //       const stream = await navigator.mediaDevices.getUserMedia({
+  //         audio: true,
+  //       });
+  //       setMediaStream(stream);
+  //       const recorder = new MediaRecorder(stream);
+  //       setMediaRecorder(recorder);
+  //       const audioChunks: Blob[] = [];
+
+  //       recorder.ondataavailable = (event) => {
+  //         audioChunks.push(event.data);
+  //       };
+
+  //       recorder.onstop = async () => {
+  //         const audioBlob = new Blob(audioChunks, { type: "audio/wav" });
+  //         const arrayBuffer = await audioBlob.arrayBuffer();
+  //         const audioHex = Array.from(new Uint8Array(arrayBuffer))
+  //           .map((b) => b.toString(16).padStart(2, "0"))
+  //           .join("");
+
+  //         const websocket = new WebSocket("ws://localhost:8000/ws/voice");
+  //         setWs(websocket);
+
+  //         websocket.onopen = () => {
+  //           websocket.send(
+  //             JSON.stringify({
+  //               audio: audioHex,
+  //               timezone: selectedTimezone,
+  //             })
+  //           );
+  //         };
+
+  //         websocket.onmessage = (event) => {
+  //           const data = JSON.parse(event.data);
+  //           if (data.error) {
+  //             setTranscription(`Error: ${data.message || data.error}`);
+  //             toast.error(data.message || "Voice command failed");
+  //           } else if (data.status === "scheduled") {
+  //             setTranscription(
+  //               `Meeting scheduled: ${data.event.title} at ${
+  //                 data.event.start
+  //               } (${selectedTimezone})${
+  //                 data.event.location ? ` at ${data.event.location}` : ""
+  //               }`
+  //             );
+  //             toast.success("Meeting scheduled successfully");
+  //             setMeetings((prev) => [...prev, formatMeeting(data.event)]);
+  //           } else if (data.status === "conflict") {
+  //             setTranscription(
+  //               `${data.event.message}. Suggested: ${data.event.suggested_start} to ${data.event.suggested_end} (${selectedTimezone})`
+  //             );
+  //             toast.warning("Scheduling conflict detected");
+  //           } else if (data.status === "missing_info") {
+  //             setTranscription(data.event.message);
+  //             toast.info("Additional information needed");
+  //           }
+
+  //           if (data.audio) {
+  //             playAudioResponse(data.audio);
+  //           }
+  //         };
+
+  //         websocket.onerror = () => {
+  //           setTranscription("Connection error. Please try again.");
+  //           toast.error("Voice connection failed");
+  //           setIsRecording(false);
+  //         };
+
+  //         websocket.onclose = () => {
+  //           setWs(null);
+  //         };
+  //       };
+
+  //       recorder.start();
+  //       setIsRecording(true);
+  //       setTranscription("Listening...");
+  //       toast.info("Listening for voice commands...");
+  //     } catch (error) {
+  //       console.error("Microphone error:", error);
+  //       setTranscription(`Error accessing microphone: ${error}`);
+  //       toast.error("Microphone access denied");
+  //       setIsRecording(false);
+  //     }
+  //   } else {
+  //     stopRecording();
+  //   }
+  // };
+const toggleRecording = async () => {
+  if (!isRecording) {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      mediaStreamRef.current = stream;
+
+      const websocket = new WebSocket("ws://localhost:8000/ws/voice");
+      wsRef.current = websocket;
+      wsRef.current.binaryType = "arraybuffer";
+
+      wsRef.current.onopen = () => {
+        websocket.send(JSON.stringify({ event: "start", timezone: selectedTimezone }));
+
+        const recorder = new MediaRecorder(stream, { mimeType: "audio/webm" });
+        mediaRecorderRef.current = recorder;
 
         recorder.ondataavailable = (event) => {
-          audioChunks.push(event.data);
+          if (event.data.size > 0) {
+            event.data.arrayBuffer().then((buffer) => {
+              websocket.send(buffer);
+            });
+          }
         };
 
-        recorder.onstop = async () => {
-          const audioBlob = new Blob(audioChunks, { type: "audio/wav" });
-          const arrayBuffer = await audioBlob.arrayBuffer();
-          const audioHex = Array.from(new Uint8Array(arrayBuffer))
-            .map((b) => b.toString(16).padStart(2, "0"))
-            .join("");
-
-          const websocket = new WebSocket("ws://localhost:8000/ws/voice");
-          setWs(websocket);
-
-          websocket.onopen = () => {
-            websocket.send(
-              JSON.stringify({
-                audio: audioHex,
-                timezone: selectedTimezone,
-              })
-            );
-          };
-
-          websocket.onmessage = (event) => {
+        recorder.start(250); // chunks every 250ms
+        setIsRecording(true);
+      };
+         wsRef.current.onmessage = (event) => {
             const data = JSON.parse(event.data);
             if (data.error) {
               setTranscription(`Error: ${data.message || data.error}`);
@@ -208,50 +291,70 @@ export default function ScheduleVoiceFramework() {
             if (data.audio) {
               playAudioResponse(data.audio);
             }
+            if (data.exit || data.final) {
+  wsRef.current?.close();
+  wsRef.current = null;
+}
           };
 
-          websocket.onerror = () => {
+          wsRef.current.onerror = () => {
             setTranscription("Connection error. Please try again.");
             toast.error("Voice connection failed");
             setIsRecording(false);
           };
 
-          websocket.onclose = () => {
-            setWs(null);
+          wsRef.current.onclose = () => {
+           console.log("WebSocket connection closed");  
           };
-        };
+    } catch (err) {
+      console.error("Mic error:", err);
+    }
 
-        recorder.start();
-        setIsRecording(true);
-        setTranscription("Listening...");
-        toast.info("Listening for voice commands...");
-      } catch (error) {
-        console.error("Microphone error:", error);
-        setTranscription(`Error accessing microphone: ${error}`);
-        toast.error("Microphone access denied");
-        setIsRecording(false);
-      }
-    } else {
-      stopRecording();
-    }
-  };
+  } else {
+    stopRecording();
+  }
 
-  const stopRecording = () => {
-    if (mediaRecorder && mediaRecorder.state !== "inactive") {
-      mediaRecorder.stop();
-    }
-    if (mediaStream) {
-      mediaStream.getTracks().forEach((track) => track.stop());
-    }
-    if (ws) {
-      ws.close();
-    }
-    setIsRecording(false);
-    setMediaRecorder(null);
-    setMediaStream(null);
-    setWs(null);
-    setTranscription("Recording stopped.");
-  };
+};
+
+
+const stopRecording = () => {
+  console.log("Stopping recording...");
+  if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
+    mediaRecorderRef.current.stop();
+  }
+  
+
+  if (wsRef.current) {
+    wsRef.current.send(JSON.stringify({ event: "end" }));
+    // wsRef.current.close();
+    // wsRef.current = null;
+  }
+
+  if (mediaStreamRef.current) {
+    mediaStreamRef.current.getTracks().forEach(track => track.stop());
+    mediaStreamRef.current = null;
+  }
+
+  setIsRecording(false);
+};
+
+
+  // const stopRecording = () => {
+  //   if (mediaRecorder && mediaRecorder.state !== "inactive") {
+  //     mediaRecorder.stop();
+  //   }
+  //   if (mediaStream) {
+  //     mediaStream.getTracks().forEach((track) => track.stop());
+  //   }
+  //   if (ws) {
+  //     ws.close();
+  //   }
+  //   setIsRecording(false);
+  //   setMediaRecorder(null);
+  //   setMediaStream(null);
+  //   setWs(null);
+  //   setTranscription("Recording stopped.");
+  // };
 
   const formatMeeting = (event: any): Meeting => ({
     title: event.title || "Scheduled Meeting",
@@ -334,6 +437,7 @@ export default function ScheduleVoiceFramework() {
                   <div className="relative">
                     <Button
                       onClick={toggleRecording}
+                     
                       size="lg"
                       className={`w-24 h-24 rounded-full transition-all duration-300 ${
                         isRecording
@@ -347,6 +451,7 @@ export default function ScheduleVoiceFramework() {
                         <Mic className="w-8 h-8 text-white" />
                       )}
                     </Button>
+                   
                     {isRecording && (
                       <>
                         <div className="absolute inset-0 rounded-full border-4 border-red-400 animate-ping opacity-75"></div>
@@ -356,6 +461,14 @@ export default function ScheduleVoiceFramework() {
                     )}
                   </div>
                 </div>
+                 <Button
+               
+                      onClick={stopRecording}
+                      size="lg"
+                      className={`w-24 h-24 rounded-full transition-all duration-300 `}
+                    
+>stop
+                    </Button>
                 <div className="grid md:grid-cols-3 gap-4">
                   <div className="space-y-2">
                     <label className="text-sm font-medium text-slate-700 flex items-center gap-2">
