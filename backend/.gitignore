@@ -126,5 +126,5 @@ whisper_tmp/
 
 
 #
-.pickle
+*.pickle
 .credentals.json
