@@ -1,13 +1,18 @@
-from openai import OpenAI
+from openai import OpenAI,AzureOpenAI
 import logging
 from config.config import Config
 import json
+import os
 
 class GPTAgent:
     def __init__(self, api_key: str):
         if not api_key:
             raise Exception("OpenAI API key not set in environment variables.")
-        self.client = OpenAI(api_key=api_key)
+       
+        self.client = AzureOpenAI(
+    api_key=os.getenv("AZURE_OPENAI_API_KEY"),
+    api_version=os.getenv("AZURE_OPENAI_API_VERSION"),
+    azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"))
         self.logger = logging.getLogger(__name__)
 
     def process_input(self, text: str) -> tuple[str, dict]:
