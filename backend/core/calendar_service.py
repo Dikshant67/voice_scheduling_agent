@@ -20,7 +20,7 @@ class CalendarService:
 
     def _get_credentials(self):
         try:
-            flow = InstalledAppFlow.from_client_secrets_file('./credentials.json', self.SCOPES)
+            flow = InstalledAppFlow.from_client_secrets_file('./config/credentials.json', self.SCOPES)
             creds = flow.run_local_server(port=0)
             with open(self.token_path, 'wb') as token:
                 pickle.dump(creds, token)
