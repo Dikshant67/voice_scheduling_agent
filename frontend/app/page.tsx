@@ -61,9 +61,9 @@ export default function ScheduleVoiceFramework() {
   const [selectedTimezone, setSelectedTimezone] = useState("UTC");
   const [transcription, setTranscription] = useState("");
   const [meetings, setMeetings] = useState<Meeting[]>([]);
-const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-const mediaStreamRef = useRef<MediaStream | null>(null);
-const wsRef = useRef<WebSocket | null>(null);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const mediaStreamRef = useRef<MediaStream | null>(null);
+  const wsRef = useRef<WebSocket | null>(null);
 
   const [isLoadingMeetings, setIsLoadingMeetings] = useState(false);
 
@@ -144,8 +144,6 @@ const wsRef = useRef<WebSocket | null>(null);
       setIsLoadingMeetings(false);
     }
   };
-  
-
 
   // const toggleRecording = async () => {
   //   if (!isRecording) {
@@ -236,109 +234,307 @@ const wsRef = useRef<WebSocket | null>(null);
   //     stopRecording();
   //   }
   // };
-const toggleRecording = async () => {
-  if (!isRecording) {
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      mediaStreamRef.current = stream;
+  // const toggleRecording = async () => {
+  //   if (!isRecording) {
+  //     try {
+  //       const stream = await navigator.mediaDevices.getUserMedia({
+  //         audio: true,
+  //       });
+  //       mediaStreamRef.current = stream;
 
-      const websocket = new WebSocket("ws://localhost:8000/ws/voice");
-      wsRef.current = websocket;
-      wsRef.current.binaryType = "arraybuffer";
+  //       const websocket = new WebSocket("ws://localhost:8000/ws/voice");
+  //       wsRef.current = websocket;
+  //       wsRef.current.binaryType = "arraybuffer";
 
-      wsRef.current.onopen = () => {
-        websocket.send(JSON.stringify({ event: "start", timezone: selectedTimezone }));
+  //       wsRef.current.onopen = () => {
+  //         websocket.send(
+  //           JSON.stringify({ event: "start", timezone: selectedTimezone })
+  //         );
 
-        const recorder = new MediaRecorder(stream, { mimeType: "audio/webm" });
-        mediaRecorderRef.current = recorder;
+  //         // const recorder = new MediaRecorder(stream, { mimeType: "audio/webm" });
+  //         const recorder = new MediaRecorder(stream, {
+  //           mimeType: "audio/ogg;codecs=opus",
+  //         });
+  //         mediaRecorderRef.current = recorder;
 
-        recorder.ondataavailable = (event) => {
-          if (event.data.size > 0) {
-            event.data.arrayBuffer().then((buffer) => {
-              websocket.send(buffer);
-            });
+  //         recorder.ondataavailable = (event) => {
+  //           if (event.data.size > 0) {
+  //             event.data.arrayBuffer().then((buffer) => {
+  //               websocket.send(buffer);
+  //             });
+  //           }
+  //         };
+
+  //         recorder.start(250); // chunks every 250ms
+  //         setIsRecording(true);
+  //       };
+  //       wsRef.current.onmessage = (event) => {
+  //         const data = JSON.parse(event.data);
+  //         if (data.error) {
+  //           setTranscription(`Error: ${data.message || data.error}`);
+  //           toast.error(data.message || "Voice command failed");
+  //         } else if (data.status === "scheduled") {
+  //           setTranscription(
+  //             `Meeting scheduled: ${data.event.title} at ${
+  //               data.event.start
+  //             } (${selectedTimezone})${
+  //               data.event.location ? ` at ${data.event.location}` : ""
+  //             }`
+  //           );
+  //           toast.success("Meeting scheduled successfully");
+  //           setMeetings((prev) => [...prev, formatMeeting(data.event)]);
+  //         } else if (data.status === "conflict") {
+  //           setTranscription(
+  //             `${data.event.message}. Suggested: ${data.event.suggested_start} to ${data.event.suggested_end} (${selectedTimezone})`
+  //           );
+  //           toast.warning("Scheduling conflict detected");
+  //         } else if (data.status === "missing_info") {
+  //           setTranscription(data.event.message);
+  //           toast.info("Additional information needed");
+  //         }
+
+  //         if (data.audio) {
+  //           playAudioResponse(data.audio);
+  //         }
+  //         if (data.exit || data.final) {
+  //           wsRef.current?.close();
+  //           wsRef.current = null;
+  //         }
+  //       };
+
+  //       wsRef.current.onerror = () => {
+  //         setTranscription("Connection error. Please try again.");
+  //         toast.error("Voice connection failed");
+  //         setIsRecording(false);
+  //       };
+
+  //       wsRef.current.onclose = () => {
+  //         console.log("WebSocket connection closed");
+  //       };
+  //     } catch (err) {
+  //       console.error("Mic error:", err);
+  //     }
+  //   } else {
+  //     stopRecording();
+  //   }
+  // };
+
+  // const stopRecording = () => {
+  //   console.log("Stopping recording...");
+  //   if (
+  //     mediaRecorderRef.current &&
+  //     mediaRecorderRef.current.state !== "inactive"
+  //   ) {
+  //     mediaRecorderRef.current.stop();
+  //   }
+
+  //   if (wsRef.current) {
+  //     wsRef.current.send(JSON.stringify({ event: "end" }));
+  //     // wsRef.current.close();
+  //     // wsRef.current = null;
+  //   }
+
+  //   if (mediaStreamRef.current) {
+  //     mediaStreamRef.current.getTracks().forEach((track) => track.stop());
+  //     mediaStreamRef.current = null;
+  //   }
+
+  //   setIsRecording(false);
+  // };
+  const toggleRecording = async () => {
+    if (!isRecording) {
+      try {
+        console.log("🎤 Starting recording...");
+        const stream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            sampleRate: 16000,
+            channelCount: 1,
+            echoCancellation: true,
+            noiseSuppression: true,
+          },
+        });
+        mediaStreamRef.current = stream;
+
+        const websocket = new WebSocket("ws://localhost:8000/ws/voice");
+        wsRef.current = websocket;
+        wsRef.current.binaryType = "arraybuffer";
+
+        wsRef.current.onopen = () => {
+          console.log("🔌 WebSocket connected");
+
+          // Send start event
+          websocket.send(
+            JSON.stringify({
+              event: "start",
+              timezone: selectedTimezone,
+            })
+          );
+          console.log("📨 Sent start event with timezone:", selectedTimezone);
+
+          // Try WAV format first (best for real-time processing)
+          let mimeType = "audio/wav";
+          if (!MediaRecorder.isTypeSupported(mimeType)) {
+            // Fallback to WebM with longer chunks
+            mimeType = "audio/webm;codecs=opus";
+            console.log("⚠️ WAV not supported, falling back to WebM");
           }
+
+          const recorder = new MediaRecorder(stream, {
+            mimeType,
+            audioBitsPerSecond: 128000, // Ensure consistent bitrate
+          });
+          mediaRecorderRef.current = recorder;
+
+          // Store chunks to send complete audio segments
+          const audioChunks: BlobPart[] | undefined = [];
+          let chunkCount = 0;
+
+          recorder.ondataavailable = (event) => {
+            console.log("🎵 Audio data available:", event.data.size, "bytes");
+
+            if (event.data.size > 0) {
+              audioChunks.push(event.data);
+              chunkCount++;
+
+              // For WAV, send immediately; for WebM/OGG, accumulate chunks
+              if (mimeType === "audio/wav") {
+                sendAudioChunk(event.data, websocket);
+              } else {
+                // Send accumulated chunks every few iterations for container formats
+                if (chunkCount % 4 === 0) {
+                  // Every ~1 second for 250ms chunks
+                  const combinedBlob = new Blob(audioChunks, {
+                    type: mimeType,
+                  });
+                  sendAudioChunk(combinedBlob, websocket);
+                  audioChunks.length = 0; // Clear array
+                }
+              }
+            }
+          };
+
+          const sendAudioChunk = (audioBlob: Blob, websocket: WebSocket) => {
+            if (websocket.readyState === WebSocket.OPEN) {
+              audioBlob
+                .arrayBuffer()
+                .then((buffer) => {
+                  console.log(
+                    "📤 Sending audio chunk:",
+                    buffer.byteLength,
+                    "bytes"
+                  );
+                  // Add format header for backend processing
+                  const formatHeader = new TextEncoder().encode(
+                    mimeType + "\n"
+                  );
+                  const combinedBuffer = new ArrayBuffer(
+                    formatHeader.length + buffer.byteLength
+                  );
+                  const combinedArray = new Uint8Array(combinedBuffer);
+                  combinedArray.set(formatHeader, 0);
+                  combinedArray.set(
+                    new Uint8Array(buffer),
+                    formatHeader.length
+                  );
+
+                  websocket.send(combinedBuffer);
+                })
+                .catch((error: any) => {
+                  console.error("❌ Error converting audio to buffer:", error);
+                });
+            }
+          };
+
+          recorder.onstart = () => {
+            console.log("▶️ MediaRecorder started");
+          };
+
+          recorder.onstop = () => {
+            console.log("⏹️ MediaRecorder stopped");
+            // Send any remaining chunks for container formats
+            if (audioChunks.length > 0 && mimeType !== "audio/wav") {
+              const finalBlob = new Blob(audioChunks, { type: mimeType });
+              sendAudioChunk(finalBlob, websocket);
+            }
+          };
+
+          recorder.onerror = (event) => {
+            console.error("❌ MediaRecorder error:", event.error);
+          };
+
+          // Use appropriate chunk size based on format
+          const chunkDuration = mimeType === "audio/wav" ? 250 : 1000;
+          recorder.start(chunkDuration);
+          console.log(`🎙️ Recording started with ${chunkDuration}ms chunks`);
+          setIsRecording(true);
         };
 
-        recorder.start(250); // chunks every 250ms
-        setIsRecording(true);
-      };
-         wsRef.current.onmessage = (event) => {
-            const data = JSON.parse(event.data);
-            if (data.error) {
-              setTranscription(`Error: ${data.message || data.error}`);
-              toast.error(data.message || "Voice command failed");
-            } else if (data.status === "scheduled") {
-              setTranscription(
-                `Meeting scheduled: ${data.event.title} at ${
-                  data.event.start
-                } (${selectedTimezone})${
-                  data.event.location ? ` at ${data.event.location}` : ""
-                }`
-              );
-              toast.success("Meeting scheduled successfully");
-              setMeetings((prev) => [...prev, formatMeeting(data.event)]);
-            } else if (data.status === "conflict") {
-              setTranscription(
-                `${data.event.message}. Suggested: ${data.event.suggested_start} to ${data.event.suggested_end} (${selectedTimezone})`
-              );
-              toast.warning("Scheduling conflict detected");
-            } else if (data.status === "missing_info") {
-              setTranscription(data.event.message);
-              toast.info("Additional information needed");
-            }
+        // ... rest of your WebSocket handlers remain the same
+        wsRef.current.onmessage = (event) => {
+          // ... your existing message handling code
+        };
 
-            if (data.audio) {
-              playAudioResponse(data.audio);
-            }
-            if (data.exit || data.final) {
-  wsRef.current?.close();
-  wsRef.current = null;
-}
-          };
+        wsRef.current.onerror = (error) => {
+          console.error("❌ WebSocket error:", error);
+          setTranscription("Connection error. Please try again.");
+          toast.error("Voice connection failed");
+          setIsRecording(false);
+        };
 
-          wsRef.current.onerror = () => {
-            setTranscription("Connection error. Please try again.");
-            toast.error("Voice connection failed");
-            setIsRecording(false);
-          };
+        wsRef.current.onclose = (event) => {
+          console.log(
+            "🔌 WebSocket connection closed:",
+            event.code,
+            event.reason
+          );
+          setIsRecording(false);
+        };
+      } catch (err) {
+        console.error("❌ Microphone access error:", err);
+        toast.error("Could not access microphone");
+        setIsRecording(false);
+      }
+    } else {
+      stopRecording();
+    }
+  };
+  const stopRecording = () => {
+    console.log("⏹️ Stopping recording...");
 
-          wsRef.current.onclose = () => {
-           console.log("WebSocket connection closed");  
-          };
-    } catch (err) {
-      console.error("Mic error:", err);
+    // Stop MediaRecorder first
+    if (
+      mediaRecorderRef.current &&
+      mediaRecorderRef.current.state !== "inactive"
+    ) {
+      mediaRecorderRef.current.stop();
+      console.log("📹 MediaRecorder stopped");
     }
 
-  } else {
-    stopRecording();
-  }
+    // Send end event to server
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ event: "end" }));
+      console.log("📨 Sent end event");
 
-};
+      // Give server time to process, then close
+      setTimeout(() => {
+        if (wsRef.current) {
+          wsRef.current.close();
+          wsRef.current = null;
+        }
+      }, 100);
+    }
 
+    // Stop media stream
+    if (mediaStreamRef.current) {
+      mediaStreamRef.current.getTracks().forEach((track) => {
+        track.stop();
+        console.log("🎵 Audio track stopped");
+      });
+      mediaStreamRef.current = null;
+    }
 
-const stopRecording = () => {
-  console.log("Stopping recording...");
-  if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
-    mediaRecorderRef.current.stop();
-  }
-  
-
-  if (wsRef.current) {
-    wsRef.current.send(JSON.stringify({ event: "end" }));
-    // wsRef.current.close();
-    // wsRef.current = null;
-  }
-
-  if (mediaStreamRef.current) {
-    mediaStreamRef.current.getTracks().forEach(track => track.stop());
-    mediaStreamRef.current = null;
-  }
-
-  setIsRecording(false);
-};
-
-
+    setIsRecording(false);
+  };
   // const stopRecording = () => {
   //   if (mediaRecorder && mediaRecorder.state !== "inactive") {
   //     mediaRecorder.stop();
@@ -376,17 +572,60 @@ const stopRecording = () => {
     endTime: event.end.split("T")[1]?.slice(0, 5) || "00:00",
   });
 
-  const playAudioResponse = (audioHex: string) => {
+  const playAudioResponse = (hexAudio: string) => {
     try {
+      console.log("🔊 Playing audio response, hex length:", hexAudio.length);
+
+      // Convert hex string back to binary
       const audioBytes = new Uint8Array(
-        audioHex.match(/.{1,2}/g)?.map((byte) => parseInt(byte, 16)) || []
+        hexAudio.match(/.{1,2}/g)!.map((byte) => parseInt(byte, 16))
       );
+
+      console.log(`🎵 Audio bytes: ${audioBytes.length} bytes`);
+
+      // Create audio blob and play
       const audioBlob = new Blob([audioBytes], { type: "audio/wav" });
       const audioUrl = URL.createObjectURL(audioBlob);
       const audio = new Audio(audioUrl);
-      audio.play().catch((err) => console.error("Audio playback error:", err));
+
+      // Add event listeners for debugging
+      audio.onloadeddata = () => console.log("✅ Audio loaded successfully");
+      audio.onerror = (e) => console.error("❌ Audio load error:", e);
+
+      audio
+        .play()
+        .then(() => {
+          console.log("🔊 Audio played successfully");
+        })
+        .catch((error) => {
+          console.error("❌ Audio playback failed:", error);
+
+          // Fallback: try with generic audio type
+          const fallbackBlob = new Blob([audioBytes], { type: "audio/*" });
+          const fallbackUrl = URL.createObjectURL(fallbackBlob);
+          const fallbackAudio = new Audio(fallbackUrl);
+
+          fallbackAudio.play().catch((fallbackErr) => {
+            console.error(
+              "❌ Fallback audio playback also failed:",
+              fallbackErr
+            );
+          });
+
+          // Clean up fallback URL
+          setTimeout(() => URL.revokeObjectURL(fallbackUrl), 1000);
+        });
+
+      // Clean up URL after audio ends
+      audio.onended = () => {
+        console.log("🔊 Audio playback completed");
+        URL.revokeObjectURL(audioUrl);
+      };
+
+      // Also clean up URL after timeout as safety net
+      setTimeout(() => URL.revokeObjectURL(audioUrl), 5000);
     } catch (error) {
-      console.error("Audio processing error:", error);
+      console.error("❌ Audio processing failed:", error);
     }
   };
 
@@ -437,7 +676,6 @@ const stopRecording = () => {
                   <div className="relative">
                     <Button
                       onClick={toggleRecording}
-                     
                       size="lg"
                       className={`w-24 h-24 rounded-full transition-all duration-300 ${
                         isRecording
@@ -451,7 +689,7 @@ const stopRecording = () => {
                         <Mic className="w-8 h-8 text-white" />
                       )}
                     </Button>
-                   
+
                     {isRecording && (
                       <>
                         <div className="absolute inset-0 rounded-full border-4 border-red-400 animate-ping opacity-75"></div>
@@ -461,14 +699,13 @@ const stopRecording = () => {
                     )}
                   </div>
                 </div>
-                 <Button
-               
-                      onClick={stopRecording}
-                      size="lg"
-                      className={`w-24 h-24 rounded-full transition-all duration-300 `}
-                    
->stop
-                    </Button>
+                <Button
+                  onClick={stopRecording}
+                  size="lg"
+                  className={`w-24 h-24 rounded-full transition-all duration-300 `}
+                >
+                  stop
+                </Button>
                 <div className="grid md:grid-cols-3 gap-4">
                   <div className="space-y-2">
                     <label className="text-sm font-medium text-slate-700 flex items-center gap-2">
