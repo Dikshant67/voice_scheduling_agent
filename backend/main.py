@@ -30,10 +30,7 @@ from core.timezone_utils import parse_datetime, validate_timezone
 from config.config import Config
 
 # Setup logging
-logging.basicConfig(level
-                    
-                    
-logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')  # Missing closing parenthesis
 logger = logging.getLogger(__name__)
 
 app = FastAPI()
@@ -49,8 +46,10 @@ app.add_middleware(
 )
 
 # Global variables
+# ADD THESE MISSING LINES:
 processing_lock = {}
 active_sessions = {}
+
 config = Config()
 calendar_service = CalendarService()
 voice_to_text = VoiceToText(config.azure_speech_key, config.azure_speech_region)
@@ -601,6 +600,53 @@ async def process_complete_audio(websocket: WebSocket, session: dict):
         
         if session_id in processing_lock:
             del processing_lock[session_id]
+# ADD THIS FUNCTION:
+async def process_meeting_scheduling(websocket: WebSocket, entities: dict, session: dict):
+    """Process meeting scheduling with enhanced error handling"""
+    try:
+        logger.info(f"Processing meeting scheduling for session {session['id']}")
+        
+        # Enhanced field completion
+        completed_entities = await fill_missing_fields_async(entities, text_to_voice, websocket, session)
+        
+        # Schedule the meeting
+        result = calendar_service.intelligent_schedule_handler(completed_entities)
+        
+        if result.get('status') == 'success':
+            meeting_details = result.get('event_details', {})
+            response_text = (f"Perfect! I've successfully scheduled your meeting "
+                           f"'{meeting_details.get('title', 'Meeting')}' "
+                           f"for {meeting_details.get('start', 'the requested time')}.")
+        else:
+            error_msg = result.get('message', 'Unknown error occurred')
+            response_text = f"I couldn't schedule the meeting: {error_msg}. Would you like to try with different details?"
+        
+        await send_audio_response(websocket, response_text, "meeting_result", session, {
+            "status": result.get('status', 'error'),
+            "event_details": result
+        })
+        
+    except Exception as e:
+        logger.error(f"💥 Meeting scheduling error for {session['id']}: {str(e)}")
+        await send_audio_response(websocket, f"Sorry, scheduling failed: {str(e)}", "error", session)
+# ADD THIS FUNCTION:
+async def fill_missing_fields_async(entities: dict, text_to_voice, websocket: WebSocket, session: dict) -> dict:
+    """Async wrapper for fill_missing_fields function"""
+    try:
+        # Import the function from conversation_flow
+        from core.conversation_flow import fill_missing_fields
+        
+        # Check if fill_missing_fields is async
+        if asyncio.iscoroutinefunction(fill_missing_fields):
+            return await fill_missing_fields(entities, text_to_voice, websocket)
+        else:
+            # If it's sync, use thread executor
+            loop = asyncio.get_event_loop()
+            return await loop.run_in_executor(None, lambda: fill_missing_fields(entities, text_to_voice, websocket))
+            
+    except Exception as e:
+        logger.error(f"Error in fill_missing_fields for {session['id']}: {e}")
+        return entities
 
 async def enhanced_speech_to_text(file_path: str, session: dict) -> str:
     """Enhanced STT with multiple language support and better error handling"""
@@ -698,91 +744,6 @@ async def process_with_gpt(user_input: str, session: dict) -> tuple:
 
 
 
-@app.websocket("/ws/voice")
-async def websocket_endpoint(websocket: WebSocket):
-    await websocket.accept()
-    logger.info("INFO:     connection open")
-    
-    audio_chunks = []
-    timezone = "UTC"
-    recording_active = False
-    
-    try:
-        await websocket.send_json({
-            "message": "🎤 Voice Assistant is ready. Say something to schedule a meeting!"
-        })
-        
-        while True:
-            try:
-                # Use receive() instead of receive_json() to handle both text and binary
-                data = await websocket.receive()
-                
-                if "text" in data:
-                    # Handle JSON messages
-                    try:
-                        message = json.loads(data["text"])
-                        logger.info(f"📨 Received JSON: {message}")
-                        
-                        if message.get("event") == "start":
-                            timezone = message.get('timezone', 'UTC')
-                            audio_chunks = []
-                            recording_active = True
-                            logger.info(f"▶️ Started recording with timezone: {timezone}")
-                            
-                        elif message.get("event") == "end":
-                            recording_active = False
-                            logger.info(f"⏹️ Recording ended, processing {len(audio_chunks)} audio chunks...")
-                            
-                            if audio_chunks:
-                                await process_audio_chunks(
-                                    websocket, audio_chunks, timezone, 
-                                    voice_to_text, gpt_agent, text_to_voice, calendar_service
-                                )
-                            else:
-                                logger.warning("⚠️ No audio chunks received")
-                                audio_response = text_to_voice.synthesize(
-                                    "I didn't receive any audio. Please try speaking again."
-                                )
-                                await websocket.send_json({"audio": audio_response.hex()})
-                                
-                    except json.JSONDecodeError as e:
-                        logger.error(f"❌ Invalid JSON received: {e}")
-                        continue
-                
-                elif "bytes" in data and recording_active:
-                    # Handle binary audio data
-                    audio_data = data["bytes"]
-                    audio_chunks.append(audio_data)
-                    logger.info(f"🎵 Received audio chunk: {len(audio_data)} bytes (Total chunks: {len(audio_chunks)})")
-                    
-                elif "bytes" in data and not recording_active:
-                    logger.warning("⚠️ Received binary data but recording is not active")
-                    
-            except WebSocketDisconnect:
-                logger.info("INFO:     connection closed")
-                break
-            except Exception as e:
-                logger.error(f"💥 Error receiving data: {e}")
-                # Don't break immediately, try to continue
-                continue
-                
-    except WebSocketDisconnect:
-        logger.info("INFO:     connection closed")
-    except Exception as e:
-        logger.error(f"💥 WebSocket error: {e}")
-        try:
-            audio_response = text_to_voice.synthesize("Connection error. Please try again.")
-            await websocket.send_json({
-                "audio": audio_response.hex(), 
-                "error": "Connection error"
-            })
-        except:
-            pass
-    finally:
-        try:
-            await websocket.close()
-        except:
-            pass
 
 
 async def process_audio_chunks(websocket, audio_chunks, timezone, voice_to_text, gpt_agent, text_to_voice, calendar_service):
@@ -879,7 +840,7 @@ async def process_audio_chunks(websocket, audio_chunks, timezone, voice_to_text,
             "error": "Audio processing failed"
         })
 @app.get("/calendar/availability")
-async def get_availability1(start: str, end: str, timezone: str):
+async def get_availability1(start: str, end: str, timezone: str,entities: dict, websocket: WebSocket, session: dict):
     try:
         # Enhanced field completion
         completed_entities = await fill_missing_fields_async(entities, text_to_voice, websocket, session)
@@ -975,7 +936,7 @@ async def test_calendar_service():
             "traceback": traceback.format_exc()
         }
 @app.get("/calendar/events")
-async def get_events(start: str, end: str, timezone: str = "Asia/Kolkata"):
+async def get_events(start: str, end: str, timezone: str,entities , websocket: WebSocket, session: dict):
     """
     Fetch calendar events within the specified date range, returning titles and times
     converted to the specified timezone (default: Asia/Kolkata).
@@ -1248,7 +1209,7 @@ async def get_sessions():
             for session_id, session in active_sessions.items()
         ]
     }
-def debug_session_state(session: dict, event: str):
+def debug_session_state(session: dict, e: str):
     """Debug session state for audio processing"""
     # logger.info(f"🔍 DEBUG SESSION STATE [{event}]:")
     logger.info(f"   📊 Session ID: {session.get('id', 'unknown')}")

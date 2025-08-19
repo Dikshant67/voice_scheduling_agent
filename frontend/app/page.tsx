@@ -1,6 +1,11 @@
 "use client";
 import React, { useState, useRef, useCallback, useEffect } from "react";
-
+import React, { useState, useRef, useCallback, useEffect } from 'react';
+import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import { Button } from '@/components/ui/button';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
+import { Mic, MicOff, Volume2, Globe } from 'lucide-react';
+import { toast } from 'react-hot-toast'; // or your toast library
 // Enhanced interfaces with better type safety
 interface AudioMessage {
   type: string;
