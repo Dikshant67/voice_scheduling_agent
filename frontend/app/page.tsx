@@ -450,6 +450,7 @@ const VoiceAssistant: React.FC<VoiceAssistantProps> = ({
 
   // Enhanced real-time recording with optimized processing
   // Enhanced real-time recording with AudioWorkletNode
+  // Replace the entire startRecording function with this:
   const startRecording = async () => {
     if (!isConnected || isRecording) {
       console.warn(
@@ -459,11 +460,11 @@ const VoiceAssistant: React.FC<VoiceAssistantProps> = ({
     }
 
     try {
-      addMessage("🎤 Initializing enhanced recording...");
+      addMessage("🎤 Initializing MediaRecorder recording...");
 
       const stream = await initializeMicrophone();
 
-      // Initialize or resume audio context
+      // Initialize AudioContext for decoding
       if (!audioContextRef.current) {
         audioContextRef.current = new (window.AudioContext ||
           (window as any).webkitAudioContext)({ sampleRate: SAMPLE_RATE });
@@ -473,60 +474,139 @@ const VoiceAssistant: React.FC<VoiceAssistantProps> = ({
         await audioContextRef.current.resume();
       }
 
-      // 🎯 ADD THE LINE HERE - Load the audio worklet processor
-      try {
-        await audioContextRef.current.audioWorklet.addModule(
-          "/audio_processor.js"
-        );
-        console.log("✅ AudioWorklet processor loaded successfully");
-      } catch (workletError) {
-        console.warn(
-          "⚠️ AudioWorklet not supported, falling back to ScriptProcessorNode:",
-          workletError
-        );
-        // Fallback to your existing ScriptProcessorNode code
-        return startRecordingWithScriptProcessor(stream);
+      // Test supported MIME types
+      const supportedTypes = [
+        "audio/webm;codecs=opus",
+        "audio/webm",
+        "audio/ogg;codecs=opus",
+        "audio/mp4",
+        "audio/wav",
+      ];
+
+      let mimeType = "";
+      for (const type of supportedTypes) {
+        if (MediaRecorder.isTypeSupported(type)) {
+          mimeType = type;
+          console.log(`✅ Using MIME type: ${type}`);
+          break;
+        }
       }
 
-      // Now create the AudioWorkletNode (this will work because processor is loaded)
-      const source = audioContextRef.current.createMediaStreamSource(stream);
+      if (!mimeType) {
+        throw new Error("No supported MediaRecorder MIME type found");
+      }
 
-      // Create AudioWorkletNode using the loaded processor
-      const workletNode = new AudioWorkletNode(
-        audioContextRef.current,
-        "audio-processor"
-      );
+      // Create MediaRecorder with proper settings
+      const recorder = new MediaRecorder(stream, {
+        mimeType: mimeType,
+        audioBitsPerSecond: 128000, // 128 kbps
+      });
 
-      // Handle audio data from worklet
-      workletNode.port.onmessage = (event) => {
-        if (event.data.type === "audio-data") {
-          const pcmData = event.data.data;
+      console.log(`🎙️ MediaRecorder state: ${recorder.state}`);
+      console.log(`🎙️ MediaRecorder mimeType: ${recorder.mimeType}`);
+
+      // Store references
+      streamRef.current = stream;
+      processorRef.current = recorder as any;
+
+      // Handle audio data chunks
+      // Handle audio data chunks - RACE CONDITION FIX
+      const audioChunks: Blob[] = []; // Add this outside the handler
+
+      recorder.ondataavailable = async (event) => {
+        console.log(`📥 MediaRecorder chunk: ${event.data.size} bytes`);
+
+        if (event.data.size > 0) {
+          // Simply accumulate all chunks - don't try to decode yet
+          audioChunks.push(event.data);
           audioChunkCountRef.current++;
 
-          // Send PCM data via WebSocket
-          if (
-            wsRef.current?.readyState === WebSocket.OPEN &&
-            pcmData.byteLength > 0
-          ) {
+          console.log(
+            `📦 Accumulated chunk ${audioChunkCountRef.current}: ${event.data.size} bytes`
+          );
+
+          // If we have multiple chunks, combine and process them
+          if (audioChunks.length >= 2) {
+            // Process every 2 chunks for better success rate
             try {
-              wsRef.current.send(pcmData);
+              // Combine accumulated chunks into one blob
+              const combinedBlob = new Blob(audioChunks, {
+                type: audioChunks[0].type,
+              });
+              const arrayBuffer = await combinedBlob.arrayBuffer();
+
               console.log(
-                `📡 Sent chunk ${audioChunkCountRef.current}: ${pcmData.byteLength} bytes`
+                `🔄 Processing combined ${arrayBuffer.byteLength} bytes`
               );
-            } catch (sendError) {
-              console.error("❌ Failed to send audio data:", sendError);
+
+              try {
+                // Try to decode the combined blob
+                const audioBuffer =
+                  await audioContextRef.current!.decodeAudioData(arrayBuffer);
+                const channelData = audioBuffer.getChannelData(0);
+                const pcmData = convertToPCM16Enhanced(channelData);
+
+                // Send to backend
+                if (wsRef.current?.readyState === WebSocket.OPEN) {
+                  wsRef.current.send(pcmData);
+                  console.log(
+                    `📡 Sent combined chunk: ${pcmData.byteLength} bytes`
+                  );
+                }
+
+                // Clear processed chunks
+                audioChunks.length = 0;
+              } catch (decodeError) {
+                console.log(
+                  `⚠️ Combined chunk still incomplete, keeping for next batch`
+                );
+                // Keep chunks for next combination attempt
+              }
+            } catch (error) {
+              console.error("❌ Processing error:", error);
+              audioChunks.length = 0; // Clear on error
             }
           }
         }
       };
 
-      // Connect the nodes
-      source.connect(workletNode);
-      workletNode.connect(audioContextRef.current.destination);
+      recorder.onerror = (event) => {
+        console.error("❌ MediaRecorder error:", event);
+        addMessage(`❌ Recording error: ${event}`);
+      };
 
-      // Store references for cleanup
-      processorRef.current = workletNode as any;
-      streamRef.current = stream;
+      // Also handle final chunks when recording stops
+      recorder.onstop = async () => {
+        console.log("⏹️ MediaRecorder stopped - processing final chunks");
+
+        if (audioChunks.length > 0) {
+          try {
+            const finalBlob = new Blob(audioChunks, {
+              type: audioChunks[0].type,
+            });
+            const arrayBuffer = await finalBlob.arrayBuffer();
+
+            const audioBuffer = await audioContextRef.current!.decodeAudioData(
+              arrayBuffer
+            );
+            const channelData = audioBuffer.getChannelData(0);
+            const pcmData = convertToPCM16Enhanced(channelData);
+
+            if (wsRef.current?.readyState === WebSocket.OPEN) {
+              wsRef.current.send(pcmData);
+              console.log(`📡 Sent final chunk: ${pcmData.byteLength} bytes`);
+            }
+          } catch (error) {
+            console.error("❌ Final chunk processing failed:", error);
+          }
+
+          audioChunks.length = 0; // Clear
+        }
+      };
+
+      recorder.onstart = () => {
+        console.log("▶️ MediaRecorder started");
+      };
 
       // Send start recording message
       if (wsRef.current?.readyState === WebSocket.OPEN) {
@@ -537,130 +617,147 @@ const VoiceAssistant: React.FC<VoiceAssistantProps> = ({
             session_info: {
               browser: navigator.userAgent,
               sample_rate: SAMPLE_RATE,
-              buffer_size: 1024,
-              audio_api: "AudioWorklet",
+              mime_type: mimeType,
+              audio_api: "MediaRecorder + AudioContext",
             },
           })
         );
       }
 
+      // Start recording with larger chunks (500ms for more reliable chunks)
+      recorder.start(1000); // 500ms chunks
       setIsRecording(true);
       setTranscription("");
-      addMessage("🔴 Enhanced recording started with AudioWorklet!");
+      addMessage(
+        "🔴 Recording started with MediaRecorder + AudioContext PCM extraction!"
+      );
+
+      // Add a test to ensure audio is being captured
+      setTimeout(() => {
+        if (audioChunkCountRef.current === 0) {
+          console.warn(
+            "⚠️ No audio chunks received after 2 seconds - check microphone"
+          );
+          addMessage(
+            "⚠️ No audio detected - please check microphone permissions"
+          );
+        }
+      }, 2000);
     } catch (error) {
       console.error("❌ Recording start failed:", error);
       addMessage(`❌ Recording failed: ${error}`);
       await cleanupAudioResources();
     }
   };
-  const startRecordingWithScriptProcessor = async (stream: MediaStream) => {
-    // This is your legacy ScriptProcessorNode code, adapted for fallback use
-    if (!audioContextRef.current) {
-      audioContextRef.current = new (window.AudioContext ||
-        (window as any).webkitAudioContext)({ sampleRate: SAMPLE_RATE });
-    }
 
-    if (audioContextRef.current.state === "suspended") {
-      await audioContextRef.current.resume();
-    }
+  // const startRecordingWithScriptProcessor = async (stream: MediaStream) => {
+  //   // This is your legacy ScriptProcessorNode code, adapted for fallback use
+  //   if (!audioContextRef.current) {
+  //     audioContextRef.current = new (window.AudioContext ||
+  //       (window as any).webkitAudioContext)({ sampleRate: SAMPLE_RATE });
+  //   }
 
-    const source = audioContextRef.current.createMediaStreamSource(stream);
-    console.log("🎤 Created MediaStreamSource from microphone");
+  //   if (audioContextRef.current.state === "suspended") {
+  //     await audioContextRef.current.resume();
+  //   }
 
-    // Add gain control
-    gainNodeRef.current = audioContextRef.current.createGain();
-    gainNodeRef.current.gain.value = 1.0;
+  //   const source = audioContextRef.current.createMediaStreamSource(stream);
+  //   console.log("🎤 Created MediaStreamSource from microphone");
 
-    // Add analyser for real-time feedback
-    analyserRef.current = audioContextRef.current.createAnalyser();
-    analyserRef.current.fftSize = 256;
-    analyserRef.current.smoothingTimeConstant = 0.3;
+  //   // Add gain control
+  //   gainNodeRef.current = audioContextRef.current.createGain();
+  //   gainNodeRef.current.gain.value = 1.0;
 
-    // Create script processor for audio processing
-    processorRef.current = audioContextRef.current.createScriptProcessor(
-      BUFFER_SIZE,
-      CHANNELS,
-      CHANNELS
-    );
+  //   // Add analyser for real-time feedback
+  //   analyserRef.current = audioContextRef.current.createAnalyser();
+  //   analyserRef.current.fftSize = 256;
+  //   analyserRef.current.smoothingTimeConstant = 0.3;
 
-    processorRef.current.onaudioprocess = (e) => {
-      if (!isRecording) return;
+  //   // Create script processor for audio processing
+  //   processorRef.current = audioContextRef.current.createScriptProcessor(
+  //     BUFFER_SIZE,
+  //     CHANNELS,
+  //     CHANNELS
+  //   );
 
-      const inputData = e.inputBuffer.getChannelData(0);
+  //   processorRef.current.onaudioprocess = (e) => {
+  //     if (!isRecording) return;
 
-      const rms = Math.sqrt(
-        inputData.reduce((sum, val) => sum + val * val, 0) / inputData.length
-      );
-      const hasAudio = rms > 0.001;
-      if (rms > 0.001) {
-        console.log(`🎵 AUDIO: RMS=${rms.toFixed(4)}`);
-      }
-      // 🎯 ADD THIS DEBUG CHECK
-      // const hasAudio = inputData.some((sample) => Math.abs(sample) > 0.001);
-      if (hasAudio) {
-        console.log(
-          `🎵 ScriptProcessor: RMS=${rms.toFixed(4)} - AUDIO DETECTED!`
-        );
-      } else {
-        console.warn(`🔇 ScriptProcessor: RMS=${rms.toFixed(4)} - SILENT`);
-      }
+  //     const inputData = e.inputBuffer.getChannelData(0);
 
-      // Convert to 16-bit PCM with enhanced processing
-      const pcmData = convertToPCM16Enhanced(inputData);
+  //     const rms = Math.sqrt(
+  //       inputData.reduce((sum, val) => sum + val * val, 0) / inputData.length
+  //     );
+  //     const hasAudio = rms > 0.001;
+  //     if (rms > 0.001) {
+  //       console.log(`🎵 AUDIO: RMS=${rms.toFixed(4)}`);
+  //     }
+  //     // 🎯 ADD THIS DEBUG CHECK
+  //     // const hasAudio = inputData.some((sample) => Math.abs(sample) > 0.001);
+  //     if (hasAudio) {
+  //       console.log(
+  //         `🎵 ScriptProcessor: RMS=${rms.toFixed(4)} - AUDIO DETECTED!`
+  //       );
+  //     } else {
+  //       console.warn(`🔇 ScriptProcessor: RMS=${rms.toFixed(4)} - SILENT`);
+  //     }
 
-      // Calculate quality metrics
-      const quality = calculateAudioQuality(inputData);
-      audioChunkCountRef.current++;
+  //     // Convert to 16-bit PCM with enhanced processing
+  //     const pcmData = convertToPCM16Enhanced(inputData);
 
-      // Send PCM data via WebSocket
-      if (
-        wsRef.current?.readyState === WebSocket.OPEN &&
-        pcmData.byteLength > 0
-      ) {
-        try {
-          wsRef.current.send(pcmData);
-          console.log(
-            `📡 Sent chunk ${audioChunkCountRef.current}: ${
-              pcmData.byteLength
-            } bytes, Quality: ${quality.toFixed(0)}`
-          );
-        } catch (sendError) {
-          console.error("❌ Failed to send audio data:", sendError);
-        }
-      }
-    };
+  //     // Calculate quality metrics
+  //     const quality = calculateAudioQuality(inputData);
+  //     audioChunkCountRef.current++;
 
-    // Connect audio processing chain
-    source.connect(gainNodeRef.current!);
-    gainNodeRef.current!.connect(analyserRef.current!);
-    analyserRef.current!.connect(processorRef.current!);
-    processorRef.current!.connect(audioContextRef.current.destination);
+  //     // Send PCM data via WebSocket
+  //     if (
+  //       wsRef.current?.readyState === WebSocket.OPEN &&
+  //       pcmData.byteLength > 0
+  //     ) {
+  //       try {
+  //         wsRef.current.send(pcmData);
+  //         console.log(
+  //           `📡 Sent chunk ${audioChunkCountRef.current}: ${
+  //             pcmData.byteLength
+  //           } bytes, Quality: ${quality.toFixed(0)}`
+  //         );
+  //       } catch (sendError) {
+  //         console.error("❌ Failed to send audio data:", sendError);
+  //       }
+  //     }
+  //   };
 
-    streamRef.current = stream;
+  //   // Connect audio processing chain
+  //   source.connect(gainNodeRef.current!);
+  //   gainNodeRef.current!.connect(analyserRef.current!);
+  //   analyserRef.current!.connect(processorRef.current!);
+  //   processorRef.current!.connect(audioContextRef.current.destination);
 
-    // Send start recording message
-    if (wsRef.current?.readyState === WebSocket.OPEN) {
-      wsRef.current.send(
-        JSON.stringify({
-          event: "start_recording",
-          timezone: timezone,
-          session_info: {
-            browser: navigator.userAgent,
-            sample_rate: SAMPLE_RATE,
-            buffer_size: BUFFER_SIZE,
-            audio_api: "ScriptProcessorNode",
-          },
-        })
-      );
-    }
+  //   streamRef.current = stream;
 
-    setIsRecording(true);
-    setTranscription("");
-    addMessage("🔴 Enhanced recording started! (ScriptProcessorNode fallback)");
+  //   // Send start recording message
+  //   if (wsRef.current?.readyState === WebSocket.OPEN) {
+  //     wsRef.current.send(
+  //       JSON.stringify({
+  //         event: "start_recording",
+  //         timezone: timezone,
+  //         session_info: {
+  //           browser: navigator.userAgent,
+  //           sample_rate: SAMPLE_RATE,
+  //           buffer_size: BUFFER_SIZE,
+  //           audio_api: "ScriptProcessorNode",
+  //         },
+  //       })
+  //     );
+  //   }
 
-    // Start real-time audio monitoring
-    startAudioMonitoring();
-  };
+  //   setIsRecording(true);
+  //   setTranscription("");
+  //   addMessage("🔴 Enhanced recording started! (ScriptProcessorNode fallback)");
+
+  //   // Start real-time audio monitoring
+  //   startAudioMonitoring();
+  // };
   // Enhanced PCM conversion with noise reduction
   const convertToPCM16Enhanced = (inputData: Float32Array): ArrayBuffer => {
     const length = inputData.length;
@@ -689,31 +786,31 @@ const VoiceAssistant: React.FC<VoiceAssistantProps> = ({
   };
 
   // Real-time audio monitoring for visual feedback
-  const startAudioMonitoring = () => {
-    if (!analyserRef.current) return;
+  // const startAudioMonitoring = () => {
+  //   if (!analyserRef.current) return;
 
-    const dataArray = new Uint8Array(analyserRef.current.frequencyBinCount);
+  //   const dataArray = new Uint8Array(analyserRef.current.frequencyBinCount);
 
-    const monitor = () => {
-      if (!isRecording || !analyserRef.current) return;
+  //   const monitor = () => {
+  //     if (!isRecording || !analyserRef.current) return;
 
-      analyserRef.current.getByteFrequencyData(dataArray);
+  //     analyserRef.current.getByteFrequencyData(dataArray);
 
-      // Calculate average frequency data for quality indication
-      const average =
-        dataArray.reduce((sum, value) => sum + value, 0) / dataArray.length;
+  //     // Calculate average frequency data for quality indication
+  //     const average =
+  //       dataArray.reduce((sum, value) => sum + value, 0) / dataArray.length;
 
-      // Update connection stats
-      setConnectionStats((prev) => ({
-        ...prev,
-        sessionDuration: (Date.now() - sessionStartTimeRef.current) / 1000,
-      }));
+  //     // Update connection stats
+  //     setConnectionStats((prev) => ({
+  //       ...prev,
+  //       sessionDuration: (Date.now() - sessionStartTimeRef.current) / 1000,
+  //     }));
 
-      requestAnimationFrame(monitor);
-    };
+  //     requestAnimationFrame(monitor);
+  //   };
 
-    monitor();
-  };
+  //   monitor();
+  // };
 
   // Enhanced stop recording with proper cleanup
   const stopRecording = async () => {
@@ -758,6 +855,7 @@ const VoiceAssistant: React.FC<VoiceAssistantProps> = ({
   };
 
   // Comprehensive audio resource cleanup
+  // Update the cleanupAudioResources function:
   const cleanupAudioResources = async () => {
     try {
       console.log("🧹 Starting enhanced cleanup...");
@@ -765,25 +863,38 @@ const VoiceAssistant: React.FC<VoiceAssistantProps> = ({
       // FIRST: Set recording to false to prevent new processing
       setIsRecording(false);
 
-      // SECOND: Handle different processor types
+      // SECOND: Handle MediaRecorder or other processors
       if (processorRef.current) {
         console.log("🔌 Disconnecting audio processor...");
 
-        // Check if it's an AudioWorkletNode (has port property)
-        if ("port" in processorRef.current && processorRef.current.port) {
+        // Check if it's a MediaRecorder
+        if (processorRef.current instanceof MediaRecorder) {
+          console.log("🔌 Cleaning up MediaRecorder...");
+          if (processorRef.current.state === "recording") {
+            processorRef.current.stop();
+          }
+          processorRef.current.ondataavailable = null;
+          processorRef.current.onerror = null;
+          processorRef.current.onstop = null;
+        }
+        // Check if it's an AudioWorkletNode
+        else if ("port" in processorRef.current && processorRef.current.port) {
           console.log("🔌 Cleaning up AudioWorkletNode...");
           processorRef.current.port.onmessage = null;
           processorRef.current.port.close();
-        } else if ("onaudioprocess" in processorRef.current) {
+          processorRef.current.disconnect();
+        }
+        // Check if it's a ScriptProcessorNode
+        else if ("onaudioprocess" in processorRef.current) {
           console.log("🔌 Cleaning up ScriptProcessorNode...");
           processorRef.current.onaudioprocess = null;
+          processorRef.current.disconnect();
         }
 
-        processorRef.current.disconnect();
         processorRef.current = null;
       }
 
-      // THIRD: Cleanup other audio nodes
+      // THIRD: Cleanup other audio nodes (keep existing code)
       if (analyserRef.current) {
         analyserRef.current.disconnect();
         analyserRef.current = null;
@@ -794,7 +905,7 @@ const VoiceAssistant: React.FC<VoiceAssistantProps> = ({
         gainNodeRef.current = null;
       }
 
-      // FOURTH: Stop all media tracks
+      // FOURTH: Stop all media tracks (keep existing code)
       if (streamRef.current) {
         streamRef.current.getTracks().forEach((track) => {
           track.stop();
