@@ -29,7 +29,7 @@ def extract_meeting_info(prompt_text):
                         f"You are a meeting assistant. Today's date is {today}. "
                         "Extract meeting details from the user's message and respond with only JSON:\n"
                         "{'intent': 'schedule_meeting', 'title': 'Team Sync', 'date': '2025-08-09', 'time': '14:00'}\n"
-                        "If details are missing, respond with: {'intent': 'incomplete'}"
+                        
                     )
                 },
                 {"role": "user", "content": prompt_text}

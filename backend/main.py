@@ -1,9 +1,24 @@
+
+import tempfile
 import azure.cognitiveservices.speech as speechsdk
 import traceback
 from fastapi import FastAPI, File, UploadFile, WebSocket, HTTPException, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 import os
 import asyncio
+from typing import Dict, Any, Optional
+import logging
+import json
+from datetime import datetime
+import pytz
+import numpy as np
+from pydub import AudioSegment
+import time
+import wave
+import io
+import struct
+from fastapi.responses import HTMLResponse
+# Import your core modules
 from core.calendar_service import CalendarService
 from core.voice_to_text import VoiceToText
 from core.text_to_voice import TextToVoice
@@ -12,19 +27,18 @@ from core.validation import validate_meeting_details
 from core.conversation_flow import fill_missing_fields, handle_scheduling
 from core.timezone_utils import parse_datetime, validate_timezone
 from config.config import Config
-import logging
-import json
-from datetime import datetime
-import pytz
 
 # Setup logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level
+                    
+                    
+logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
-# CORS configuration for frontend
-origins = ["http://localhost:3000"]
+# CORS configuration
+origins = ["http://localhost:3000", "http://localhost:3001", "https://localhost:3000"]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
@@ -33,165 +47,502 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Initialize services
+# Global variables
+processing_lock = {}
+active_sessions = {}
 config = Config()
 calendar_service = CalendarService()
 voice_to_text = VoiceToText(config.azure_speech_key, config.azure_speech_region)
 text_to_voice = TextToVoice(config.azure_speech_key, config.azure_speech_region)
 gpt_agent = GPTAgent(config.gpt_api_key)
+
+
+
 time=datetime.now()  # Initialize current time for logging
 # Exit commands
+
 EXIT_COMMANDS = ["stop", "exit", "quit", "bye", "goodbye", "that's it", "cancel", "okay"]
+
+# Audio processing constants
+SAMPLE_RATE = 16000
+CHANNELS = 1
+BYTES_PER_SAMPLE = 2
+CHUNK_SIZE = 1024  # Optimal chunk size for real-time processing
+SILENCE_THRESHOLD = 300  # Amplitude threshold for silence detection
+SILENCE_DURATION = 1.5  # Seconds of silence before auto-processing
 
 @app.get("/", tags=["root"])
 async def read_root():
-    return {"message": "Voice-based Meeting Scheduler API"}
+    return {"message": "🎤 Voice-based Meeting Scheduler API v2.0"}
 
-# @app.websocket("/ws/voice")
-# async def websocket_endpoint(websocket: WebSocket):
+
+@app.websocket("/ws/voice-live")
+async def live_voice_websocket(websocket: WebSocket):
+    """Enhanced WebSocket for real-time audio processing"""
     await websocket.accept()
-    audio_chunks = []
-    timezone = "UTC"
-    recording_active = False
+    session_id = str(id(websocket))
+    logger.info(f"🔗 New WebSocket connection: {session_id}")
+    
+    # Initialize session
+    session = {
+        'id': session_id,
+        'audio_buffer': bytearray(),
+        'timezone': 'UTC',
+        'is_recording': False,
+        'silence_timer': None,
+        'processing': False,
+        'temp_files': [],
+        'last_activity': time.time(),
+        'total_audio_duration': 0,
+        'chunk_count': 0,
+        'audio_quality_samples': []
+    }
+    
+    active_sessions[session_id] = session
+    
+    try:
+        # Send enhanced greeting
+        greeting_msg = "Voice Assistant ready! High-quality real-time processing enabled."
+        await send_audio_response(websocket, greeting_msg, "greeting", session)
+          # FIXED: Single message handling loop
+        while True:
+            try:
+                # Receive any message (text or bytes)
+                message = await websocket.receive()
+                # logger.info(f"📥 Received message from {session_id}")
+                if message["type"] == "websocket.receive" and "text" in message:
+                    # Handle control messages (JSON)
+                    try:
+                        data = json.loads(message["text"])
+                        logger.info(f"📥 INSIDE TEXT BLOCK Received audio chunk ({len(message['text'])} bytes) from {session_id}")
+                        await handle_control_message(websocket, data, session)
+                    except json.JSONDecodeError:
+                        logger.error("❌ Invalid JSON received")
+                        await send_error_response(websocket, "Invalid message format", session)
+                        
+                elif message["type"] == "websocket.receive" and "bytes" in message:
+                    # Handle binary audio data
+                    audio_bytes = message["bytes"]
+                    logger.info(f"📥 RECEIVED AUDIO: {len(audio_bytes)} bytes from {session_id}")
+    # Log first few bytes to verify it's not all zeros
+                    if len(audio_bytes) >= 10:
+                        sample = audio_bytes[:10]
+                        logger.info(f"   📊 Audio sample: {[hex(b) for b in sample]}")
+        
+        # Check if audio is all zeros (silence)
+                        if all(b == 0 for b in audio_bytes):
+                            logger.warning("⚠️ Received audio chunk is all zeros (silence)")
+    
+                    await handle_audio_chunk(websocket, message["bytes"], session)
+                    
+                elif message["type"] == "websocket.disconnect":
+                    logger.info(f"🔌 WebSocket {session_id} disconnected normally")
+                    break
+                    
+            except Exception as e:
+                logger.error(f"💥 Error processing message for {session_id}: {e}")
+                break
+                    
+    except WebSocketDisconnect:
+        logger.info(f"🔌 WebSocket {session_id} disconnected")
+    except Exception as e:
+        logger.error(f"💥 Fatal WebSocket error for {session_id}: {e}")
+        try:
+            await send_error_response(websocket, "Connection error occurred")
+        except:
+            pass
+    finally:
+        await cleanup_session(session)
+        if session_id in active_sessions:
+            del active_sessions[session_id]
+
+async def handle_control_message(websocket: WebSocket, message: dict, session: dict):
+    """Enhanced control message handler with better error handling"""
+    try:
+        event = message.get("event")
+        session['last_activity'] = time.time()
+        
+        logger.info(f"📨 Control event [{session['id']}]: {event}")
+        
+        if event == "start_recording":
+            logger.info(f"▶️ Start recording requested for {session['id']}")
+            session['timezone'] = message.get('timezone', 'UTC')
+            session['is_recording'] = True
+            session['audio_buffer'].clear()
+            session['chunk_count'] = 0
+            session['total_audio_duration'] = 0
+            session['audio_quality_samples'].clear()
+            
+            logger.info(f"▶️ Recording started for {session['id']} with timezone: {session['timezone']}")
+            
+            await websocket.send_json({
+                "type": "recording_started",
+                "message": "🔴 Recording started - speak now!",
+                "session_id": session['id'],
+                "timestamp": datetime.now().isoformat()
+            })
+            
+        elif event == "stop_recording":
+            session['is_recording'] = False
+            logger.info(f"⏹️ Stop recording requested for {session['id']}")
+            
+            if len(session['audio_buffer']) > 0 and not session['processing']:
+                await process_complete_audio(websocket, session)
+            else:
+                await websocket.send_json({
+                    "type": "recording_stopped",
+                    "message": "Recording stopped - no audio to process",
+                    "session_id": session['id']
+                })
+            
+        elif event == "cancel_recording":
+            await cancel_recording(websocket, session)
+            
+        elif event == "ping":
+            await websocket.send_json({
+                "type": "pong",
+                "session_id": session['id'],
+                "timestamp": datetime.now().isoformat()
+            })
+            
+    except Exception as e:
+        logger.error(f"💥 Error handling control message for {session['id']}: {e}")
+        await send_error_response(websocket, f"Control error: {str(e)}")
+
+async def handle_audio_chunk(websocket: WebSocket, audio_data: bytes, session: dict):
+    """Enhanced audio chunk handler with quality monitoring"""
+    try:
+        # if not session['is_recording'] or session['processing']:
+        #      logger.warning(f"🚫 Skipping chunk - Recording: {session['is_recording']}, Processing: {session['processing']}")
+        #      return
+        
+        session['last_activity'] = time.time()
+        session['chunk_count'] += 1
+        
+        # Add to buffer
+        buffer_before = len(session['audio_buffer'])
+        session['audio_buffer'].extend(audio_data)
+        buffer_after = len(session['audio_buffer'])
+        
+        logger.info(f"📊 Chunk {session['chunk_count']}: Buffer {buffer_before} → {buffer_after} bytes (+{len(audio_data)})")
+        
+        # Calculate audio quality metrics
+        quality_metrics = analyze_audio_quality(audio_data)
+        session['audio_quality_samples'].append(quality_metrics)
+        
+        # Estimate audio duration (assuming 16kHz, 16-bit, mono)
+        duration_increment = len(audio_data) / (SAMPLE_RATE * BYTES_PER_SAMPLE)
+        session['total_audio_duration'] += duration_increment
+        
+        logger.debug(f"🎵 Chunk {session['chunk_count']}: {len(audio_data)} bytes, "
+                    f"Quality: {quality_metrics['rms']:.0f}, "
+                    f"Total duration: {session['total_audio_duration']:.2f}s")
+        
+        # Advanced silence detection
+        is_silent = quality_metrics['rms'] < SILENCE_THRESHOLD
+        
+        if is_silent:
+            if session['silence_timer'] is None and session['total_audio_duration'] > 0.5:
+                session['silence_timer'] = asyncio.create_task(
+                    silence_timeout(websocket, session, SILENCE_DURATION)
+                )
+        else:
+            # Cancel silence timer if we detect audio
+            if session['silence_timer']:
+                session['silence_timer'].cancel()
+                session['silence_timer'] = None
+        
+        # Send real-time feedback
+        if session['chunk_count'] % 10 == 0:  # Every 10th chunk
+            avg_quality = np.mean([s['rms'] for s in session['audio_quality_samples'][-10:]])
+            await websocket.send_json({
+                "type": "audio_feedback",
+                "chunk_count": session['chunk_count'],
+                "total_bytes": len(session['audio_buffer']),
+                "duration": round(session['total_audio_duration'], 2),
+                "quality": round(avg_quality, 0),
+                "is_silent": is_silent
+            })
+        
+    except Exception as e:
+        logger.error(f"💥 Error handling audio chunk for {session['id']}: {e}")
+
+def analyze_audio_quality(audio_data: bytes) -> dict:
+    """Analyze audio quality metrics"""
+    try:
+        if len(audio_data) < 2:
+            return {'rms': 0, 'peak': 0, 'snr_estimate': 0}
+            
+        # Convert bytes to int16 samples
+        samples = np.frombuffer(audio_data, dtype=np.int16)
+        
+        # Calculate RMS (Root Mean Square)
+        rms = np.sqrt(np.mean(samples.astype(np.float32)**2))
+        
+        # Peak amplitude
+        peak = np.max(np.abs(samples))
+        
+        # Simple SNR estimate (signal-to-noise ratio)
+        if rms > 0:
+            snr_estimate = 20 * np.log10(peak / max(rms, 1))
+        else:
+            snr_estimate = 0
+        
+        return {
+            'rms': float(rms),
+            'peak': float(peak),
+            'snr_estimate': float(snr_estimate)
+        }
+        
+    except Exception as e:
+        logger.warning(f"⚠️ Audio quality analysis failed: {e}")
+        return {'rms': 0, 'peak': 0, 'snr_estimate': 0}
+
+async def silence_timeout(websocket: WebSocket, session: dict, delay: float):
+    """Enhanced silence timeout with progressive delay"""
+    try:
+        await asyncio.sleep(delay)
+        
+        if len(session['audio_buffer']) > 0 and not session['processing']:
+            logger.info(f"🔇 Silence timeout triggered for {session['id']}, processing audio...")
+            await process_complete_audio(websocket, session)
+            
+    except asyncio.CancelledError:
+        logger.debug(f"🔇 Silence timer cancelled for {session['id']}")
+    except Exception as e:
+        logger.error(f"💥 Error in silence timeout for {session['id']}: {e}")
+
+async def process_complete_audio(websocket: WebSocket, session: dict):
+    """Enhanced audio processing with better error handling and optimization"""
+    session_id = session['id']
+        
+    # Log buffer state
+    buffer_size = len(session['audio_buffer'])
+    logger.info(f"🔄 Starting audio processing for {session_id}:")
+    logger.info(f"   📊 Buffer size: {buffer_size} bytes")
+    logger.info(f"   📊 Chunk count: {session['chunk_count']}")
+    logger.info(f"   📊 Duration: {session['total_audio_duration']:.2f}s")
+    logger.info(f"   📊 Recording: {session['is_recording']}")
+    logger.info(f"   📊 Processing: {session['processing']}")
+    
+    if buffer_size == 0:
+        logger.error(f"❌ Audio buffer is EMPTY for session {session_id}!")
+        await send_audio_response(websocket, 
+            "No audio data received. Please try recording again.", 
+            "no_audio", session)
+        return
+        
+    # Prevent duplicate processing
+    # if session_id in processing_lock or session['processing']:
+    #     logger.warning(f"⚠️ Already processing session {session_id}, skipping")
+    #     return
+        
+    # processing_lock[session_id] = True
+    session['processing'] = True
+    temp_file = None
+    # Prevent duplicate processing
+    # if session_id in processing_lock or session['processing']:
+    #     logger.warning(f"⚠️ Already processing session {session_id}, skipping")
+    #     return
+        
+    # # processing_lock[session_id] = True
+    # session['processing'] = True
+    # temp_file = None
     
     try:
         await websocket.send_json({
-            "message": "🎤 Voice Assistant is ready. Say something to schedule a meeting!"
+            "type": "processing_started",
+            "message": "🔄 Processing your speech...",
+            "audio_duration": round(session['total_audio_duration'], 2),
+            "audio_size": len(session['audio_buffer']),
+            "session_id": session_id
+        })
+        logger.info(f"🔄 Processing audio for session {session_id} ({len(session['audio_buffer'])} bytes)"  )
+        # Validate audio buffer
+        # if len(session['audio_buffer']) < SAMPLE_RATE:  # Less than 1 second
+        #     await send_audio_response(websocket, 
+        #         "I didn't receive enough audio. Please speak for at least 1 second.", 
+        #         "insufficient_audio", session)
+        #     return
+        
+        # Quality check
+        # overall_quality = validate_audio_buffer_quality(session['audio_buffer'])
+        # if not overall_quality['is_valid']:
+        #     await send_audio_response(websocket, 
+        #         f"Audio quality issue: {overall_quality['reason']}. Please try again.", 
+        #         "poor_quality", session)
+        #     return
+        
+        # Save audio as WAV file
+        temp_file = await save_pcm_as_wav(session['audio_buffer'])
+        if not temp_file:
+            raise Exception("Failed to save audio file")
+            
+        session['temp_files'].append(temp_file)
+        
+        # Enhanced Speech-to-Text
+        user_input = await enhanced_speech_to_text(temp_file, session)
+        
+        # if not user_input or len(user_input.strip()) < 2:
+        #     await send_audio_response(websocket, 
+        #         "I couldn't understand what you said. Please speak more clearly and try again.", 
+        #         "unclear_speech", session)
+        #     return
+        
+        await websocket.send_json({
+            "type": "transcription",
+            "text": user_input,
+            "confidence": "high",  # You could get this from Azure STT
+            "session_id": session_id
         })
         
-        while True:
-            try:
-                # Try to receive JSON message first
-                data = await websocket.receive_json()
-                
-                if data.get("event") == "start":
-                    timezone = data.get('timezone', 'UTC')
-                    audio_chunks = []  # Reset audio chunks
-                    recording_active = True
-                    logger.info(f"Started recording with timezone: {timezone}")
-                    
-                elif data.get("event") == "end":
-                    recording_active = False
-                    logger.info("Recording ended, processing audio...")
-                    
-                    # Process accumulated audio chunks
-                    if audio_chunks:
-                        try:
-                            # Combine all audio chunks
-                            combined_audio = b''.join(audio_chunks)
-                            logger.info(f"Processing {len(combined_audio)} bytes of audio data")
-                            
-                            # Convert audio to text
-                            user_input = voice_to_text.recognize(combined_audio).strip().lower()
-                            
-                            if not user_input:
-                                audio_response = text_to_voice.synthesize(
-                                    "Sorry, I didn't catch that. Could you please repeat?"
-                                )
-                                await websocket.send_json({"audio": audio_response.hex()})
-                                continue
-                            
-                            logger.info(f"👤 You said: {user_input}")
-                            
-                            # Check for exit commands
-                            if any(cmd in user_input for cmd in EXIT_COMMANDS):
-                                goodbye = "Thanks for using the voice assistant. Have a great day!"
-                                audio_response = text_to_voice.synthesize(goodbye)
-                                await websocket.send_json({
-                                    "audio": audio_response.hex(), 
-                                    "message": "👋 Exiting",
-                                    "exit": True
-                                })
-                                break
-                            
-                            # Process with GPT agent
-                            intent, entities = gpt_agent.process_input(user_input)
-                            logger.info(f"🤖 GPT Result: intent={intent}, entities={entities}")
-                            
-                            if intent != "schedule_meeting":
-                                response_text = entities.get("reply", "I didn't understand that. Please try again.")
-                                audio_response = text_to_voice.synthesize(response_text)
-                                await websocket.send_json({
-                                    "audio": audio_response.hex(), 
-                                    "message": response_text
-                                })
-                                continue
-                            
-                            # Add timezone to entities
-                            entities['timezone'] = timezone
-                            
-                            # Fill missing fields and schedule meeting
-                            try:
-                                gpt_result = fill_missing_fields(entities, text_to_voice, websocket)
-                                result = calendar_service.intelligent_schedule_handler(gpt_result)
-                                audio_response = handle_scheduling(result, text_to_voice)
-                                
-                                await websocket.send_json({
-                                    "status": result['status'],
-                                    "event": result,
-                                    "audio": audio_response.hex()
-                                })
-                                
-                                # Log the interaction
-                                with open("data/logs/interaction.log", "a") as log_file:
-                                    log_file.write(f"Scheduled: {json.dumps(result)}\n")
-                                    
-                            except Exception as e:
-                                logger.error(f"Error scheduling meeting: {str(e)}")
-                                audio_response = text_to_voice.synthesize(f"Error: {str(e)}")
-                                await websocket.send_json({
-                                    "audio": audio_response.hex(), 
-                                    "error": str(e)
-                                })
-                        
-                        except Exception as e:
-                            logger.error(f"Error processing audio: {str(e)}")
-                            audio_response = text_to_voice.synthesize(
-                                "Sorry, I had trouble processing your audio. Please try again."
-                            )
-                            await websocket.send_json({
-                                "audio": audio_response.hex(), 
-                                "error": "Audio processing failed"
-                            })
-                    else:
-                        # No audio chunks received
-                        audio_response = text_to_voice.synthesize(
-                            "I didn't receive any audio. Please try speaking again."
-                        )
-                        await websocket.send_json({"audio": audio_response.hex()})
-                
-            except Exception as json_error:
-                # If JSON parsing fails, try to receive binary data
-                try:
-                    if recording_active:
-                        audio_data = await websocket.receive_bytes()
-                        audio_chunks.append(audio_data)
-                        logger.info(f"Received audio chunk: {len(audio_data)} bytes")
-                    else:
-                        # Received binary data but not recording
-                        logger.warning("Received binary data but recording is not active")
-                        
-                except Exception as binary_error:
-                    logger.error(f"Error receiving data: JSON={json_error}, Binary={binary_error}")
-                    break
-                    
-    except WebSocketDisconnect:
-        logger.info("WebSocket disconnected")
+        # Check for exit commands
+        if any(cmd in user_input.lower() for cmd in EXIT_COMMANDS):
+            await send_audio_response(websocket, 
+                "Goodbye! Thanks for using the voice assistant.", 
+                "goodbye", session)
+            return
+        
+        # Enhanced GPT Processing
+        try:
+            intent, entities = await process_with_gpt(user_input, session)
+        except Exception as e:
+            logger.error(f"💥 GPT processing error for {session_id}: {e}")
+            await send_audio_response(websocket, 
+                "I had trouble understanding your request. Please try rephrasing it.", 
+                "processing_error", session)
+            return
+        
+        if intent != "schedule_meeting":
+            response_text = entities.get("reply", 
+                "I can help you schedule meetings. Please tell me about the meeting you'd like to schedule - "
+                "include details like who you're meeting with, when, and for how long.")
+            await send_audio_response(websocket, response_text, "clarification", session)
+            return
+        
+        # Enhanced Meeting Scheduling
+        entities['timezone'] = session['timezone']
+        await process_meeting_scheduling(websocket, entities, session)
+        
     except Exception as e:
-        logger.error(f"WebSocket error: {str(e)}")
-        try:
-            audio_response = text_to_voice.synthesize("Connection error. Please try again.")
-            await websocket.send_json({
-                "audio": audio_response.hex(), 
-                "error": "Connection error"
-            })
-        except:
-            pass  # Connection might be already closed
+        logger.error(f"💥 Processing error for {session_id}: {str(e)}")
+        await send_audio_response(websocket, 
+            "I encountered an error processing your request. Please try again.", 
+            "error", session)
     finally:
-        try:
-            await websocket.close()
-        except:
+        # Cleanup
+        session['processing'] = False
+        session['audio_buffer'].clear()
+        session['chunk_count'] = 0
+        session['total_audio_duration'] = 0
+        
+        if session['silence_timer']:
+            session['silence_timer'].cancel()
+            session['silence_timer'] = None
+        
+        if temp_file:
+            # cleanup_temp_file(temp_file)
             pass
+        
+        if session_id in processing_lock:
+            del processing_lock[session_id]
+
+async def enhanced_speech_to_text(file_path: str, session: dict) -> str:
+    """Enhanced STT with multiple language support and better error handling"""
+    
+    try:
+        logger.info(f"🎙️ Enhanced STT processing for {session['id']}")
+        
+        if not os.path.exists(file_path):
+            raise Exception(f"Audio file not found: {file_path}")
+            
+        file_size = os.path.getsize(file_path)
+        logger.info(f"📊 Audio file size: {file_size} bytes")
+        
+        # Enhanced speech config
+        speech_config = speechsdk.SpeechConfig(
+            subscription=config.azure_speech_key,
+            region=config.azure_speech_region
+        )
+        
+        # Enable detailed results
+        speech_config.enable_dictation()
+        speech_config.request_word_level_timestamps()
+        
+        # Try multiple languages/models
+        language_configs = [
+            {"lang": "en-US", "model": "latest"},
+            # {"lang": "en-GB", "model": "latest"},
+            # {"lang": "en-AU", "model": "latest"}
+        ]
+        
+        for config_item in language_configs:
+            try:
+                speech_config.speech_recognition_language = config_item["lang"]
+                
+                # Use continuous recognition for better accuracy
+                audio_input = speechsdk.audio.AudioConfig(filename=file_path)
+                speech_recognizer = speechsdk.SpeechRecognizer(
+                    speech_config=speech_config, 
+                    audio_config=audio_input
+                )
+                
+                # Add event handlers for detailed feedback
+                result = speech_recognizer.recognize_once()
+                
+                if result.reason == speechsdk.ResultReason.RecognizedSpeech:
+                    if result.text and len(result.text.strip()) > 0:
+                        confidence = getattr(result, 'confidence', 0.8)
+                        logger.info(f"✅ STT Success ({config_item['lang']}): '{result.text}' (confidence: {confidence})")
+                        return result.text.strip()
+                        
+                elif result.reason == speechsdk.ResultReason.NoMatch:
+                    logger.warning(f"⚠️ No speech recognized with {config_item['lang']}")
+                    
+                elif result.reason == speechsdk.ResultReason.Canceled:
+                    cancellation = result.cancellation_details
+                    logger.warning(f"⚠️ STT Canceled ({config_item['lang']}): {cancellation.reason}")
+                    
+            except Exception as lang_error:
+                logger.warning(f"⚠️ STT failed for {config_item['lang']}: {lang_error}")
+                continue
+        
+        return ""
+            
+    except Exception as e:
+        logger.error(f"💥 Enhanced STT error: {str(e)}")
+        return ""
+
+async def process_with_gpt(user_input: str, session: dict) -> tuple:
+    """Enhanced GPT processing with context awareness"""
+    try:
+        # Add session context for better understanding
+        context = {
+            'timezone': session.get('timezone', 'UTC'),
+            'session_duration': time.time() - session.get('start_time', time.time()),
+            'previous_interactions': getattr(session, 'interaction_history', [])
+        }
+        
+        # Process with context
+        intent, entities = gpt_agent.process_input(user_input)
+        
+        # Store interaction history
+        if not hasattr(session, 'interaction_history'):
+            session['interaction_history'] = []
+        session['interaction_history'].append({
+            'input': user_input,
+            'intent': intent,
+            'timestamp': datetime.now().isoformat()
+        })
+        
+        return intent, entities
+        
+    except Exception as e:
+        logger.error(f"💥 GPT processing error: {e}")
+        raise
+
+
+
 @app.websocket("/ws/voice")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
@@ -375,10 +726,35 @@ async def process_audio_chunks(websocket, audio_chunks, timezone, voice_to_text,
 @app.get("/calendar/availability")
 async def get_availability1(start: str, end: str, timezone: str):
     try:
-        availability = calendar_service.get_availability(start, end, timezone)
-        return {"availability": availability}
+        # Enhanced field completion
+        completed_entities = await fill_missing_fields_async(entities, text_to_voice, websocket, session)
+        
+        # Schedule the meeting
+        result = calendar_service.intelligent_schedule_handler(completed_entities)
+        
+        if result.get('status') == 'success':
+            meeting_details = result.get('event_details', {})
+            response_text = (f"Perfect! I've successfully scheduled your meeting "
+                           f"'{meeting_details.get('title', 'Meeting')}' "
+                           f"for {meeting_details.get('start', 'the requested time')}. "
+                           f"You'll receive a confirmation shortly.")
+        else:
+            error_msg = result.get('message', 'Unknown error occurred')
+            response_text = f"I couldn't schedule the meeting: {error_msg}. Would you like to try with different details?"
+        
+        await send_audio_response(websocket, response_text, "meeting_result", session, {
+            "status": result.get('status', 'error'),
+            "event_details": result
+        })
+        
+        # Enhanced logging
+        log_interaction(result, session)
+        
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+
+        logger.error(f"💥 Meeting scheduling error for {session['id']}: {str(e)}")
+        await send_error_response(websocket, f"Scheduling failed: {str(e)}")
+
     
 @app.get("/calendar/test1")
 async def test_availability(start: str, end: str, timezone: str):
@@ -457,43 +833,283 @@ async def get_events(start: str, end: str, timezone: str = "Asia/Kolkata"):
     Returns:
         dict: List of events with titles, start, and end times
     """
-    try:
-        # Parse and validate input dates
-        start_dt = parse_datetime(start)
-        end_dt = parse_datetime(end)
-        validate_timezone(timezone)
 
-        # Fetch events using CalendarService
-        events = calendar_service.fetch_existing_events(start_dt, end_dt, timezone)
-        
-        # Return events in a clean format
-        return {
-            "events": [
-                {
-                    "title": event["title"],
-                    "start": event["start"],
-                    "end": event["end"]
-                } for event in events
-            ]
-        }
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=f"Invalid input: {str(e)}")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error fetching events: {str(e)}")
-@app.get("/test/tts")
-async def test_tts():
-    """Test endpoint to verify TTS is working"""
     try:
-        test_text = "Hello, this is a test of the text to speech system"
-        audio_data = text_to_voice.synthesize(test_text)
-        return {
-            "status": "success",
-            "message": "TTS working",
-            "audio_size": len(audio_data),
-            "audio": audio_data.hex()
-        }
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, fill_missing_fields, entities, text_to_voice, websocket)
     except Exception as e:
-        return {"status": "error", "message": str(e)}    
+        logger.error(f"Error in fill_missing_fields for {session['id']}: {e}")
+        return entities
+
+def validate_audio_buffer_quality(audio_buffer: bytearray) -> dict:
+    """Comprehensive audio quality validation"""
+    try:
+        if len(audio_buffer) < SAMPLE_RATE * BYTES_PER_SAMPLE * 0.5:  # Less than 0.5 seconds
+            return {'is_valid': False, 'reason': 'Audio too short (minimum 0.5 seconds required)'}
+        
+        # Convert to numpy array for analysis
+        samples = np.frombuffer(audio_buffer, dtype=np.int16)
+        
+        # Check for silence
+        max_amplitude = np.max(np.abs(samples))
+        if max_amplitude < 100:
+            return {'is_valid': False, 'reason': 'Audio too quiet or silent'}
+        
+        # Check for clipping
+        clipping_ratio = np.sum(np.abs(samples) > 30000) / len(samples)
+        if clipping_ratio > 0.1:  # More than 10% clipped
+            return {'is_valid': False, 'reason': 'Audio is heavily clipped/distorted'}
+        
+        # Calculate overall quality metrics
+        rms = np.sqrt(np.mean(samples.astype(np.float32)**2))
+        dynamic_range = max_amplitude / max(rms, 1)
+        
+        if rms < 200:
+            return {'is_valid': False, 'reason': 'Audio level too low'}
+        
+        return {
+            'is_valid': True, 
+            'quality_score': min(100, int(rms / 50)),
+            'dynamic_range': dynamic_range
+        }
+        
+    except Exception as e:
+        logger.error(f"💥 Audio quality validation error: {e}")
+        return {'is_valid': False, 'reason': 'Unable to analyze audio quality'}
+
+async def save_pcm_as_wav(audio_buffer: bytearray) -> Optional[str]:
+    """Save PCM audio buffer as WAV file with proper headers"""
+    try:
+        logger.info(f"💾 Creating WAV file from {len(audio_buffer)} bytes of PCM data")
+        if len(audio_buffer) == 0:
+            logger.error("❌ Cannot create WAV file: audio buffer is empty!")
+            return None
+        temp_fd, temp_path = tempfile.mkstemp(suffix='.wav', prefix='voice_assistant_')
+        
+        with os.fdopen(temp_fd, 'wb') as f:
+            # Write WAV file using wave module for proper formatting
+            with wave.open(f, 'wb') as wav_file:
+                wav_file.setnchannels(CHANNELS)
+                wav_file.setsampwidth(BYTES_PER_SAMPLE)
+                wav_file.setframerate(SAMPLE_RATE)
+                wav_file.writeframes(audio_buffer)
+                logger.info(f"📝 Writing {len(audio_buffer)} bytes to WAV file")
+                wav_file.writeframes(audio_buffer)
+        # Verify file was created successfully
+        if os.path.exists(temp_path):
+            file_size = os.path.getsize(temp_path)
+            logger.info(f"📁 Created WAV file: {temp_path} ({file_size} bytes)")
+            if file_size <= 44:  # WAV header is 44 bytes
+                logger.error(f"❌ WAV file is too small ({file_size} bytes) - likely empty!")
+                return None
+            return temp_path
+        
+        return None
+        
+    except Exception as e:
+        logger.error(f"💥 Error saving PCM as WAV: {e}")
+        return None
+
+async def send_audio_response(websocket: WebSocket, text: str, response_type: str, 
+                            session: dict, extra_data: dict = None):
+    """Enhanced audio response with better synthesis and error handling"""
+    try:
+        response_data = {
+            "type": response_type,
+            "message": text,
+            "session_id": session['id'],
+            "timestamp": datetime.now().isoformat()
+        }
+        
+        if extra_data:
+            response_data.update(extra_data)
+        
+        # Enhanced audio synthesis
+        try:
+            audio_response = text_to_voice.synthesize(text)
+            logger.info(f"🔊 Synthesized audio for response [{session['id']}]: {len(audio_response)} bytes")
+            if audio_response and len(audio_response) > 0:
+                response_data["audio"] = audio_response.hex()
+                response_data["audio_duration"] = estimate_audio_duration(audio_response)
+        except Exception as audio_error:
+            logger.warning(f"⚠️ Audio synthesis failed for {session['id']}: {audio_error}")
+            # Continue without audio
+        
+        await websocket.send_json(response_data)
+        logger.info(f"🗣️ Sent response [{session['id']}]: {response_type}")
+        
+    except Exception as e:
+        logger.error(f"💥 Error sending response to {session['id']}: {e}")
+
+async def send_error_response(websocket: WebSocket, error_message: str, session: dict = None):
+    """Send standardized error response"""
+    session_id = session['id'] if session else 'unknown'
+    await send_audio_response(websocket, f"Sorry, {error_message}", "error", 
+                            session or {'id': session_id})
+
+def estimate_audio_duration(audio_data: bytes) -> float:
+    """Estimate audio duration from synthesized audio"""
+    try:
+        # This is a rough estimate - actual implementation would depend on TTS format
+        return len(audio_data) / (SAMPLE_RATE * BYTES_PER_SAMPLE)
+    except:
+        return 0.0
+
+async def cancel_recording(websocket: WebSocket, session: dict):
+    """Cancel recording with proper cleanup"""
+    try:
+        session['is_recording'] = False
+        session['processing'] = False
+        session['audio_buffer'].clear()
+        session['chunk_count'] = 0
+        session['total_audio_duration'] = 0
+        
+        if session['silence_timer']:
+            session['silence_timer'].cancel()
+            session['silence_timer'] = None
+        
+        logger.info(f"❌ Recording cancelled for {session['id']}")
+        
+        await websocket.send_json({
+            "type": "recording_cancelled",
+            "message": "Recording cancelled successfully",
+            "session_id": session['id']
+        })
+        
+    except Exception as e:
+
+        logger.error(f"💥 Error cancelling recording for {session['id']}: {e}")
+
+async def cleanup_session(session: dict):
+    """Enhanced session cleanup"""
+    try:
+        session_id = session.get('id', 'unknown')
+        logger.info(f"🧹 Cleaning up session {session_id}")
+        
+        if session.get('silence_timer'):
+            session['silence_timer'].cancel()
+        
+        for temp_file in session.get('temp_files', []):
+            cleanup_temp_file(temp_file)
+        
+        # Clear all session data
+        session.clear()
+        
+    except Exception as e:
+        logger.error(f"💥 Error during cleanup: {e}")
+
+def cleanup_temp_file(file_path: str):
+    """Enhanced temp file cleanup with retry mechanism"""
+    max_retries = 3
+    retry_delay = 0.1
+    
+    for attempt in range(max_retries):
+        try:
+            if file_path and os.path.exists(file_path):
+                os.unlink(file_path)
+                logger.debug(f"🗑️ Cleaned up: {file_path}")
+                return
+        except PermissionError:
+            if attempt < max_retries - 1:
+                logger.warning(f"⚠️ Cleanup attempt {attempt + 1} failed, retrying...")
+                time.sleep(retry_delay)
+                retry_delay *= 2
+            else:
+                logger.warning(f"⚠️ Failed to cleanup {file_path} after {max_retries} attempts")
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to cleanup {file_path}: {e}")
+            break
+
+def log_interaction(result: dict, session: dict):
+    """Enhanced interaction logging"""
+    try:
+        log_dir = "data/logs"
+        os.makedirs(log_dir, exist_ok=True)
+        
+        log_entry = {
+            "timestamp": datetime.now().isoformat(),
+            "session_id": session.get('id'),
+            "timezone": session.get('timezone'),
+            "audio_duration": session.get('total_audio_duration'),
+            "result": result
+        }
+        
+        # Daily log files
+        date_str = datetime.now().strftime("%Y-%m-%d")
+        log_file_path = f"{log_dir}/interactions_{date_str}.log"
+        
+        with open(log_file_path, "a", encoding='utf-8') as log_file:
+            log_file.write(f"{json.dumps(log_entry, ensure_ascii=False)}\n")
+            
+    except Exception as e:
+        logger.warning(f"⚠️ Failed to log interaction: {e}")
+
+
+@app.get("/debug", response_class=HTMLResponse)
+async def debug_dashboard():
+    html_content = f"""
+    <html>
+    <head><title>Voice Assistant Debug Dashboard</title></head>
+    <body>
+        <h1>🐛 Debug Dashboard</h1>
+        <h2>Active Sessions: {len(active_sessions)}</h2>
+        <div id="sessions">
+        {"".join([f'''
+            <div style="border:1px solid #ccc; margin:10px; padding:10px;">
+                <h3>Session: {sid}</h3>
+                <p>Recording: {session.get('is_recording', False)}</p>
+                <p>Processing: {session.get('processing', False)}</p>
+                <p>Buffer: {len(session.get('audio_buffer', []))} bytes</p>
+                <p>Duration: {session.get('total_audio_duration', 0):.2f}s</p>
+            </div>
+        ''' for sid, session in active_sessions.items()])}
+        </div>
+        <script>setTimeout(() => location.reload(), 2000);</script>
+    </body>
+    </html>
+    """
+    return html_content
+
+# Health check and monitoring endpoints
+@app.get("/health")
+async def health_check():
+    return {
+        "status": "healthy",
+        "active_sessions": len(active_sessions),
+        "timestamp": datetime.now().isoformat()
+    }
+
+@app.get("/sessions")
+async def get_sessions():
+    return {
+        "active_sessions": len(active_sessions),
+        "sessions": [
+            {
+                "id": session_id,
+                "is_recording": session.get('is_recording', False),
+                "processing": session.get('processing', False),
+                "audio_duration": session.get('total_audio_duration', 0)
+            }
+            for session_id, session in active_sessions.items()
+        ]
+    }
+def debug_session_state(session: dict, event: str):
+    """Debug session state for audio processing"""
+    logger.info(f"🔍 DEBUG SESSION STATE [{event}]:")
+    logger.info(f"   📊 Session ID: {session.get('id', 'unknown')}")
+    logger.info(f"   📊 Recording: {session.get('is_recording', False)}")
+    logger.info(f"   📊 Processing: {session.get('processing', False)}")
+    logger.info(f"   📊 Buffer size: {len(session.get('audio_buffer', []))} bytes")
+    logger.info(f"   📊 Chunk count: {session.get('chunk_count', 0)}")
+    logger.info(f"   📊 Duration: {session.get('total_audio_duration', 0):.2f}s")
+    
+    # Sample first few bytes of buffer
+    if session.get('audio_buffer'):
+        sample = session['audio_buffer'][:10]
+        logger.info(f"   📊 Buffer sample: {[hex(b) for b in sample]}")
+
+        raise HTTPException(status_code=500, detail=f"Error fetching events: {str(e)}")
+
 
 @app.post("/upload-audio")
 async def upload_audio(file: UploadFile = File(...)):
@@ -518,4 +1134,10 @@ async def upload_audio(file: UploadFile = File(...)):
     
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(
+        app, 
+        host="0.0.0.0", 
+        port=8000,
+        log_level="info",
+        access_log=True
+    )
