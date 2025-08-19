@@ -18,6 +18,7 @@ import io
 import struct
 from fastapi.responses import HTMLResponse
 # Import your core modules
+from core.smart_audio_processor import SmartAudioProcessor
 from core.calendar_service import CalendarService
 from core.voice_to_text import VoiceToText
 from core.text_to_voice import TextToVoice
@@ -51,6 +52,9 @@ calendar_service = CalendarService()
 voice_to_text = VoiceToText(config.azure_speech_key, config.azure_speech_region)
 text_to_voice = TextToVoice(config.azure_speech_key, config.azure_speech_region)
 gpt_agent = GPTAgent(config.gpt_api_key)
+# Add these lines after line 39 (after gpt_agent = GPTAgent...)
+audio_processors: Dict[int, SmartAudioProcessor] = {}
+processing_status: Dict[int, bool] = {}
 
 EXIT_COMMANDS = ["stop", "exit", "quit", "bye", "goodbye", "that's it", "cancel", "okay"]
 
@@ -65,17 +69,152 @@ SILENCE_DURATION = 1.5  # Seconds of silence before auto-processing
 @app.get("/", tags=["root"])
 async def read_root():
     return {"message": "🎤 Voice-based Meeting Scheduler API v2.0"}
+async def handle_audio_data(websocket: WebSocket, session_id: int, audio_data: bytes):
+    """Handle incoming audio with smart processing"""
+    
+    if processing_status.get(session_id, False):
+        print("⚠️ Already processing, skipping chunk")
+        return
+    
+    processor = audio_processors.get(session_id)
+    if not processor:
+        return
+    
+    # Check if ready to process complete sentence
+    should_process = processor.add_audio_chunk(audio_data)
+    
+    if should_process:
+        processing_status[session_id] = True
+        
+        try:
+            # Get complete audio
+            complete_audio = processor.get_complete_audio()
+            
+            # Send processing message
+            await websocket.send_json({
+                "type": "processing_started",
+                "message": "🔄 Processing complete sentence...",
+                "audio_duration": len(complete_audio) / (16000 * 2)
+            })
+            
+            # Process with your existing logic
+            await process_complete_audio(websocket, session_id, complete_audio)
+            
+        except Exception as e:
+            print(f"❌ Processing error: {e}")
+            await websocket.send_json({
+                "type": "processing_error",
+                "message": f"Processing failed: {e}"
+            })
+        finally:
+            processing_status[session_id] = False
+
+
+async def handle_audio_data_smart(websocket: WebSocket, session_id: int, audio_data: bytes):
+    """Handle audio data with smart processing logic"""
+    
+    if processing_status.get(session_id, False):
+        logger.warning("⚠️ Already processing, skipping chunk")
+        return
+    
+    processor = audio_processors.get(session_id)
+    session = active_sessions.get(session_id)
+    
+    if not processor or not session:
+        return
+    
+    # Use SmartAudioProcessor to determine if ready to process
+    should_process = processor.add_audio_chunk(audio_data)
+    
+    # IMPORTANT: Update session buffer with SmartAudioProcessor's buffer
+    if should_process:
+        processing_status[session_id] = True
+        
+        try:
+            # Get complete audio from SmartAudioProcessor
+            complete_audio = processor.get_complete_audio()
+            
+            # FIXED: Update session buffer with complete audio
+            session['audio_buffer'] = bytearray(complete_audio)
+            session['total_audio_duration'] = len(complete_audio) / (16000 * 2)
+            
+            # Send processing message
+            await websocket.send_json({
+                "type": "processing_started",
+                "message": "🔄 Processing complete sentence...",
+                "audio_duration": len(complete_audio) / (16000 * 2)
+            })
+            
+            # Process with existing logic
+            await process_complete_audio(websocket, session)
+            
+        except Exception as e:
+            logger.error(f"❌ Smart processing error: {e}")
+            await websocket.send_json({
+                "type": "processing_error",
+                "message": f"Processing failed: {e}"
+            })
+        finally:
+            processing_status[session_id] = False
+
+
+async def handle_control_message_new(websocket: WebSocket, message: dict, session: dict, websocket_id: int):
+    """Handle control messages with smart processor integration"""
+    try:
+        event = message.get("event")
+        
+        if event == "start_recording":
+            # Reset both processors using the numeric ID
+            if websocket_id in audio_processors:
+                audio_processors[websocket_id].reset()
+            
+            session['is_recording'] = True
+            session['audio_buffer'].clear()
+            session['timezone'] = message.get('timezone', 'UTC')
+            
+            await websocket.send_json({
+                "type": "recording_started",
+                "message": "🔴 Recording started - speak now!"
+            })
+        
+        elif event == "stop_recording":
+            session['is_recording'] = False
+            
+            # Use the numeric ID for audio_processors
+            processor = audio_processors.get(websocket_id)
+            if processor and len(processor.audio_buffer) > 0:
+                complete_audio = processor.get_complete_audio()
+                session['audio_buffer'] = bytearray(complete_audio)
+                await process_complete_audio(websocket, session)
+            
+            await websocket.send_json({
+                "type": "recording_stopped",
+                "message": "⏹️ Recording stopped"
+            })
+        
+        elif event == "ping":
+            await websocket.send_json({
+                "type": "pong",
+                "session_id": session['id']
+            })
+            
+    except Exception as e:
+        logger.error(f"❌ Error in handle_control_message_new: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
 
 @app.websocket("/ws/voice-live")
-async def live_voice_websocket(websocket: WebSocket):
-    """Enhanced WebSocket for real-time audio processing"""
+async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
-    session_id = str(id(websocket))
-    logger.info(f"🔗 New WebSocket connection: {session_id}")
+    session_id = id(websocket)
+    
+    # Initialize processor for this session
+    audio_processors[session_id] = SmartAudioProcessor()
+    processing_status[session_id] = False
     
     # Initialize session
     session = {
-        'id': session_id,
+        'id': str(session_id),
         'audio_buffer': bytearray(),
         'timezone': 'UTC',
         'is_recording': False,
@@ -85,66 +224,71 @@ async def live_voice_websocket(websocket: WebSocket):
         'last_activity': time.time(),
         'total_audio_duration': 0,
         'chunk_count': 0,
-        'audio_quality_samples': []
+        'audio_quality_samples': [],
+        'greeting_sent': False  # ADD THIS FLAG
     }
     
     active_sessions[session_id] = session
     
     try:
-        # Send enhanced greeting
-        greeting_msg = "Voice Assistant ready! High-quality real-time processing enabled."
-        await send_audio_response(websocket, greeting_msg, "greeting", session)
-          # FIXED: Single message handling loop
+        # Send greeting
+        if not session['greeting_sent']:
+            greeting_msg = "Voice Assistant ready! High-quality real-time processing enabled."
+            await send_audio_response(websocket, greeting_msg, "greeting", session)
+            session['greeting_sent'] = True
+        
         while True:
             try:
-                # Receive any message (text or bytes)
                 message = await websocket.receive()
-                # logger.info(f"📥 Received message from {session_id}")
-                if message["type"] == "websocket.receive" and "text" in message:
-                    # Handle control messages (JSON)
-                    try:
-                        data = json.loads(message["text"])
-                        logger.info(f"📥 INSIDE TEXT BLOCK Received audio chunk ({len(message['text'])} bytes) from {session_id}")
-                        await handle_control_message(websocket, data, session)
-                    except json.JSONDecodeError:
-                        logger.error("❌ Invalid JSON received")
-                        await send_error_response(websocket, "Invalid message format", session)
+                # Add this debug logging in your WebSocket loop before processing:
+                # logger.info(f"🔍 DEBUG - Message received: {message}")
+                # logger.info(f"🔍 DEBUG - Message type: {type(message)}")
+                # if "text" in message:
+                #      logger.info(f"🔍 DEBUG - Text content: {message['text']}")
+                #      logger.info(f"🔍 DEBUG - Text type: {type(message['text'])}")
+
+                # FIXED: Better message type checking
+                if message.get("type") == "websocket.receive":
+                    if "text" in message:
+                        # Handle control messages
+                        try:
+                            text_data = message["text"]
+                            if isinstance(text_data, str):  # Ensure it's a string
+                                data = json.loads(text_data)
+                                logger.info(f"📨 Control event [{session_id}]: {data.get('event')}")
+                                await handle_control_message_new(websocket, data, session, session_id)
+                            else:
+                                logger.error(f"❌ Invalid text data type: {type(text_data)}")
+                        except json.JSONDecodeError as e:
+                            logger.error(f"❌ Invalid JSON received: {e}")
+                        except Exception as e:
+                            logger.error(f"❌ Error processing text message: {e}")
+                            
+                    elif "bytes" in message:
+                        # Handle audio data with SMART processing
+                        await handle_audio_data_smart(websocket, session_id, message["bytes"])
                         
-                elif message["type"] == "websocket.receive" and "bytes" in message:
-                    # Handle binary audio data
-                    audio_bytes = message["bytes"]
-                    logger.info(f"📥 RECEIVED AUDIO: {len(audio_bytes)} bytes from {session_id}")
-    # Log first few bytes to verify it's not all zeros
-                    if len(audio_bytes) >= 10:
-                        sample = audio_bytes[:10]
-                        logger.info(f"   📊 Audio sample: {[hex(b) for b in sample]}")
-        
-        # Check if audio is all zeros (silence)
-                        if all(b == 0 for b in audio_bytes):
-                            logger.warning("⚠️ Received audio chunk is all zeros (silence)")
-    
-                    await handle_audio_chunk(websocket, message["bytes"], session)
-                    
-                elif message["type"] == "websocket.disconnect":
-                    logger.info(f"🔌 WebSocket {session_id} disconnected normally")
-                    break
-                    
             except Exception as e:
-                logger.error(f"💥 Error processing message for {session_id}: {e}")
-                break
-                    
+                   # Check if it's a disconnect error
+                if "disconnect" in str(e).lower() or "receive" in str(e).lower():
+                    logger.info(f"🔌 WebSocket {session_id} disconnected: {e}")
+                    break
+                else:
+                    logger.error(f"❌ Error in WebSocket loop: {e}")
+                
     except WebSocketDisconnect:
         logger.info(f"🔌 WebSocket {session_id} disconnected")
-    except Exception as e:
-        logger.error(f"💥 Fatal WebSocket error for {session_id}: {e}")
-        try:
-            await send_error_response(websocket, "Connection error occurred")
-        except:
-            pass
     finally:
-        await cleanup_session(session)
+        # Cleanup
+        audio_processors.pop(session_id, None)
+        processing_status.pop(session_id, None)
+        active_sessions.pop(session_id, None)
+        if session_id in audio_processors:
+            audio_processors.pop(session_id, None)
+        if session_id in processing_status:
+            processing_status.pop(session_id, None)
         if session_id in active_sessions:
-            del active_sessions[session_id]
+            active_sessions.pop(session_id, None)
 
 async def handle_control_message(websocket: WebSocket, message: dict, session: dict):
     """Enhanced control message handler with better error handling"""
@@ -378,13 +522,24 @@ async def process_complete_audio(websocket: WebSocket, session: dict):
         #         "I couldn't understand what you said. Please speak more clearly and try again.", 
         #         "unclear_speech", session)
         #     return
-        
-        await websocket.send_json({
+        if user_input and len(user_input.strip()) > 0:
+            await websocket.send_json({
             "type": "transcription",
             "text": user_input,
             "confidence": "high",  # You could get this from Azure STT
             "session_id": session_id
         })
+        else:
+        # Send error if no transcription
+            await websocket.send_json({
+            "type": "transcription",
+            "text": "No speech recognized",
+            "confidence": "low", 
+            "session_id": session_id
+        })
+            await send_audio_response(websocket, 
+            "I couldn't understand what you said. Please try again.", 
+            "unclear_speech", session)
         
         # Check for exit commands
         if any(cmd in user_input.lower() for cmd in EXIT_COMMANDS):
@@ -624,7 +779,7 @@ async def save_pcm_as_wav(audio_buffer: bytearray) -> Optional[str]:
                 wav_file.setframerate(SAMPLE_RATE)
                 wav_file.writeframes(audio_buffer)
                 logger.info(f"📝 Writing {len(audio_buffer)} bytes to WAV file")
-                wav_file.writeframes(audio_buffer)
+                # wav_file.writeframes(audio_buffer)
         # Verify file was created successfully
         if os.path.exists(temp_path):
             file_size = os.path.getsize(temp_path)
@@ -824,7 +979,7 @@ async def get_sessions():
     }
 def debug_session_state(session: dict, event: str):
     """Debug session state for audio processing"""
-    logger.info(f"🔍 DEBUG SESSION STATE [{event}]:")
+    # logger.info(f"🔍 DEBUG SESSION STATE [{event}]:")
     logger.info(f"   📊 Session ID: {session.get('id', 'unknown')}")
     logger.info(f"   📊 Recording: {session.get('is_recording', False)}")
     logger.info(f"   📊 Processing: {session.get('processing', False)}")
