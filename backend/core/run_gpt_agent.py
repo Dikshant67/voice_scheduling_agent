@@ -3,6 +3,7 @@ import logging
 from config.config import Config
 import json
 import os
+import datetime
 
 class GPTAgent:
     def __init__(self, api_key: str):
@@ -14,13 +15,17 @@ class GPTAgent:
     api_version=os.getenv("AZURE_OPENAI_API_VERSION"),
     azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"))
         self.logger = logging.getLogger(__name__)
-
+    now = datetime.datetime.now()
+    date = now.strftime("%Y-%m-%d")  # 2025-08-19
+    time = now.strftime("%H:%M:%S")  # 16:54:30
+    
     def process_input(self, text: str) -> tuple[str, dict]:
         try:
             self.logger.info(f"Processing input: {text}")
             prompt = """
             You are a voice assistant for scheduling meetings. Extract the intent and entities from the user's input. 
             The intent should be 'schedule_meeting' for scheduling requests or 'other' for unrelated requests.
+            consider todays date is {date}  and time is {time}
             Entities should include:
             - title: Meeting title (string)
             - date: Date in YYYY-MM-DD format (string)
