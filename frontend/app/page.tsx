@@ -1,11 +1,6 @@
 "use client";
 import React, { useState, useRef, useCallback, useEffect } from "react";
-import React, { useState, useRef, useCallback, useEffect } from 'react';
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
-import { Button } from '@/components/ui/button';
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
-import { Mic, MicOff, Volume2, Globe } from 'lucide-react';
-import { toast } from 'react-hot-toast'; // or your toast library
+
 // Enhanced interfaces with better type safety
 interface AudioMessage {
   type: string;
@@ -57,13 +52,11 @@ const VoiceAssistant: React.FC<VoiceAssistantProps> = ({
   // Enhanced state management
   const [isConnected, setIsConnected] = useState(false);
   const [isRecording, setIsRecording] = useState(false);
-
   const [isProcessing, setIsProcessing] = useState(false);
   const [messages, setMessages] = useState<string[]>([]);
   const [transcription, setTranscription] = useState<string>("");
   const [connectionStatus, setConnectionStatus] =
     useState<string>("Disconnected");
-  const [isConnecting, setIsConnecting] = useState(false);
   const [audioFeedback, setAudioFeedback] = useState<AudioFeedback | null>(
     null
   );
@@ -74,38 +67,6 @@ const VoiceAssistant: React.FC<VoiceAssistantProps> = ({
     sessionDuration: 0,
   });
   const [sessionId, setSessionId] = useState<string>("");
-
-  const [selectedVoice, setSelectedVoice] = useState("en-IN-NeerjaNeural");
-  const [selectedTimezone, setSelectedTimezone] = useState("UTC");
-  const [transcription, setTranscription] = useState("");
-  const [meetings, setMeetings] = useState<Meeting[]>([]);
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-  const mediaStreamRef = useRef<MediaStream | null>(null);
-  const wsRef = useRef<WebSocket | null>(null);
-
-  const [isLoadingMeetings, setIsLoadingMeetings] = useState(false);
-
-  const voiceCommands: VoiceCommand[] = [
-    { command: "Schedule meeting", description: "Create a new meeting" },
-    { command: "Cancel meeting", description: "Cancel existing meeting" },
-    { command: "List meetings", description: "Show all meetings" },
-    { command: "Set reminder", description: "Add meeting reminder" },
-  ];
-
-  const voices = [
-    { value: "en-IN-NeerjaNeural", label: "English (India) - Female" },
-    { value: "en-US-JennyNeural", label: "English (US) - Female" },
-    { value: "en-US-GuyNeural", label: "English (US) - Male" },
-    { value: "en-GB-SoniaNeural", label: "English (UK) - Female" },
-  ];
-
-  const timezones = [
-    { value: "America/Los_Angeles", label: "UTC-8 (PST)" },
-    { value: "America/New_York", label: "UTC-5 (EST)" },
-    { value: "UTC", label: "UTC+0 (GMT)" },
-    { value: "Europe/Paris", label: "UTC+1 (CET)" },
-    { value: "Asia/Kolkata", label: "UTC+5:30 (IST)" },
-  ];
 
   // Enhanced refs for real-time audio processing
   const wsRef = useRef<WebSocket | null>(null);
@@ -135,7 +96,7 @@ const VoiceAssistant: React.FC<VoiceAssistantProps> = ({
   // Enhanced WebSocket connection with auto-reconnect
   const connectWebSocket = useCallback(() => {
     try {
-      if (isConnecting || wsRef.current?.readyState === WebSocket.OPEN) {
+      if (wsRef.current?.readyState === WebSocket.OPEN) {
         console.log("🔗 WebSocket already connected");
         return;
       }
@@ -148,7 +109,6 @@ const VoiceAssistant: React.FC<VoiceAssistantProps> = ({
       wsRef.current.onopen = () => {
         console.log("✅ WebSocket connected successfully");
         setIsConnected(true);
-        setIsConnecting(false);
         setConnectionStatus("Connected");
         sessionStartTimeRef.current = Date.now();
         addMessage("🟢 Connected to enhanced voice assistant");
@@ -181,7 +141,6 @@ const VoiceAssistant: React.FC<VoiceAssistantProps> = ({
         setConnectionStatus("Disconnected");
         setIsRecording(false);
         setIsProcessing(false);
-        setIsConnecting(false);
         addMessage(`🔴 Disconnected (Code: ${event.code})`);
 
         // Auto-reconnect if enabled and not a clean close
@@ -194,7 +153,6 @@ const VoiceAssistant: React.FC<VoiceAssistantProps> = ({
         console.error("💥 WebSocket error:", error);
         setConnectionStatus("Connection Error");
         addMessage("❌ Connection error occurred");
-        setIsConnecting(false);
 
         if (autoReconnect) {
           scheduleReconnect();
@@ -207,7 +165,7 @@ const VoiceAssistant: React.FC<VoiceAssistantProps> = ({
         scheduleReconnect();
       }
     }
-  }, [websocketUrl, autoReconnect, isConnecting]);
+  }, [websocketUrl, autoReconnect]);
 
   // Auto-reconnect mechanism
   const scheduleReconnect = useCallback(() => {
@@ -427,7 +385,6 @@ const VoiceAssistant: React.FC<VoiceAssistantProps> = ({
     }
   };
 
-
   // Fallback HTML5 audio playback
   const playWithHtml5Audio = async (audioData: Uint8Array): Promise<void> => {
     try {
@@ -556,87 +513,76 @@ const VoiceAssistant: React.FC<VoiceAssistantProps> = ({
       // Handle audio data chunks - RACE CONDITION FIX
       const audioChunks: Blob[] = []; // Add this outside the handler
 
-      let totalSentChunks = 0;
-
-      // recorder.ondataavailable = async (event) => {
-      //   console.log(`📥 MediaRecorder chunk: ${event.data.size} bytes`);
-
-      //   if (event.data.size > 0) {
-      //     audioChunks.push(event.data);
-      //     audioChunkCountRef.current++;
-
-      //     console.log(
-      //       `📦 Accumulated chunk ${audioChunkCountRef.current}: ${event.data.size} bytes`
-      //     );
-
-      //     // Try to process chunks every 3-4 accumulated chunks
-      //     if (audioChunks.length >= 3) {
-      //       try {
-      //         const combinedBlob = new Blob(audioChunks, {
-      //           type: audioChunks[0].type,
-      //         });
-      //         const arrayBuffer = await combinedBlob.arrayBuffer();
-
-      //         console.log(
-      //           `🔄 Processing combined ${arrayBuffer.byteLength} bytes`
-      //         );
-
-      //         try {
-      //           // Try to decode the combined audio
-      //           const audioBuffer =
-      //             await audioContextRef.current!.decodeAudioData(
-      //               arrayBuffer.slice(0)
-      //             );
-      //           const channelData = audioBuffer.getChannelData(0);
-      //           const pcmData = convertToPCM16Enhanced(channelData);
-
-      //           // Send to backend
-      //           if (wsRef.current?.readyState === WebSocket.OPEN) {
-      //             wsRef.current.send(pcmData);
-      //             totalSentChunks++;
-      //             console.log(
-      //               `📡 Sent chunk ${totalSentChunks}: ${pcmData.byteLength} bytes`
-      //             );
-      //           }
-
-      //           // Clear only the processed chunks (keep last 1 for continuity)
-      //           audioChunks.splice(0, audioChunks.length - 1);
-      //         } catch (decodeError) {
-      //           console.log(
-      //             `⚠️ Decode failed, keeping chunks for bigger batch`
-      //           );
-      //           // Don't clear chunks - let them accumulate for next attempt
-      //           if (audioChunks.length > 10) {
-      //             // Prevent memory overflow - clear oldest chunks
-      //             audioChunks.splice(0, 5);
-      //           }
-      //         }
-      //       } catch (error) {
-      //         console.error("❌ Processing error:", error);
-      //       }
-      //     }
-      //   }
-      // };
-      // Simplified approach - send complete audio only at the end
-      const allAudioChunks: Blob[] = [];
-
       recorder.ondataavailable = async (event) => {
+        console.log(`📥 MediaRecorder chunk: ${event.data.size} bytes`);
+
         if (event.data.size > 0) {
-          allAudioChunks.push(event.data);
+          // Simply accumulate all chunks - don't try to decode yet
+          audioChunks.push(event.data);
+          audioChunkCountRef.current++;
+
           console.log(
-            `📦 Accumulated chunk ${allAudioChunks.length}: ${event.data.size} bytes`
+            `📦 Accumulated chunk ${audioChunkCountRef.current}: ${event.data.size} bytes`
           );
+
+          // If we have multiple chunks, combine and process them
+          if (audioChunks.length >= 2) {
+            // Process every 2 chunks for better success rate
+            try {
+              // Combine accumulated chunks into one blob
+              const combinedBlob = new Blob(audioChunks, {
+                type: audioChunks[0].type,
+              });
+              const arrayBuffer = await combinedBlob.arrayBuffer();
+
+              console.log(
+                `🔄 Processing combined ${arrayBuffer.byteLength} bytes`
+              );
+
+              try {
+                // Try to decode the combined blob
+                const audioBuffer =
+                  await audioContextRef.current!.decodeAudioData(arrayBuffer);
+                const channelData = audioBuffer.getChannelData(0);
+                const pcmData = convertToPCM16Enhanced(channelData);
+
+                // Send to backend
+                if (wsRef.current?.readyState === WebSocket.OPEN) {
+                  wsRef.current.send(pcmData);
+                  console.log(
+                    `📡 Sent combined chunk: ${pcmData.byteLength} bytes`
+                  );
+                }
+
+                // Clear processed chunks
+                audioChunks.length = 0;
+              } catch (decodeError) {
+                console.log(
+                  `⚠️ Combined chunk still incomplete, keeping for next batch`
+                );
+                // Keep chunks for next combination attempt
+              }
+            } catch (error) {
+              console.error("❌ Processing error:", error);
+              audioChunks.length = 0; // Clear on error
+            }
+          }
         }
       };
 
-      recorder.onstop = async () => {
-        console.log("⏹️ Processing all accumulated chunks...");
+      recorder.onerror = (event) => {
+        console.error("❌ MediaRecorder error:", event);
+        addMessage(`❌ Recording error: ${event}`);
+      };
 
-        if (allAudioChunks.length > 0) {
+      // Also handle final chunks when recording stops
+      recorder.onstop = async () => {
+        console.log("⏹️ MediaRecorder stopped - processing final chunks");
+
+        if (audioChunks.length > 0) {
           try {
-            // Combine ALL chunks at the end
-            const finalBlob = new Blob(allAudioChunks, {
-              type: allAudioChunks[0].type,
+            const finalBlob = new Blob(audioChunks, {
+              type: audioChunks[0].type,
             });
             const arrayBuffer = await finalBlob.arrayBuffer();
 
@@ -648,51 +594,16 @@ const VoiceAssistant: React.FC<VoiceAssistantProps> = ({
 
             if (wsRef.current?.readyState === WebSocket.OPEN) {
               wsRef.current.send(pcmData);
-              console.log(
-                `📡 Sent complete recording: ${pcmData.byteLength} bytes`
-              );
+              console.log(`📡 Sent final chunk: ${pcmData.byteLength} bytes`);
             }
           } catch (error) {
-            console.error("❌ Complete audio processing failed:", error);
+            console.error("❌ Final chunk processing failed:", error);
           }
 
-          allAudioChunks.length = 0;
+          audioChunks.length = 0; // Clear
         }
       };
-      recorder.onerror = (event) => {
-        console.error("❌ MediaRecorder error:", event);
-        addMessage(`❌ Recording error: ${event}`);
-      };
 
-      // Also handle final chunks when recording stops
-      // IMPORTANT: Process final chunks when recording stops
-      // recorder.onstop = async () => {
-      //   console.log("⏹️ MediaRecorder stopped - processing final chunks");
-
-      //   if (audioChunks.length > 0) {
-      //     try {
-      //       const finalBlob = new Blob(audioChunks, {
-      //         type: audioChunks[0].type,
-      //       });
-      //       const arrayBuffer = await finalBlob.arrayBuffer();
-
-      //       const audioBuffer = await audioContextRef.current!.decodeAudioData(
-      //         arrayBuffer
-      //       );
-      //       const channelData = audioBuffer.getChannelData(0);
-      //       const pcmData = convertToPCM16Enhanced(channelData);
-
-      //       if (wsRef.current?.readyState === WebSocket.OPEN) {
-      //         wsRef.current.send(pcmData);
-      //         console.log(`📡 Sent final chunk: ${pcmData.byteLength} bytes`);
-      //       }
-      //     } catch (error) {
-      //       console.error("❌ Final chunk processing failed:", error);
-      //     }
-
-      //     audioChunks.length = 0;
-      //   }
-      // };
       recorder.onstart = () => {
         console.log("▶️ MediaRecorder started");
       };
@@ -744,400 +655,6 @@ const VoiceAssistant: React.FC<VoiceAssistantProps> = ({
   //   if (!audioContextRef.current) {
   //     audioContextRef.current = new (window.AudioContext ||
   //       (window as any).webkitAudioContext)({ sampleRate: SAMPLE_RATE });
-  // const toggleRecording = async () => {
-  //   if (!isRecording) {
-  //     try {
-  //       const stream = await navigator.mediaDevices.getUserMedia({
-  //         audio: true,
-  //       });
-  //       setMediaStream(stream);
-  //       const recorder = new MediaRecorder(stream);
-  //       setMediaRecorder(recorder);
-  //       const audioChunks: Blob[] = [];
-
-  //       recorder.ondataavailable = (event) => {
-  //         audioChunks.push(event.data);
-  //       };
-
-  //       recorder.onstop = async () => {
-  //         const audioBlob = new Blob(audioChunks, { type: "audio/wav" });
-  //         const arrayBuffer = await audioBlob.arrayBuffer();
-  //         const audioHex = Array.from(new Uint8Array(arrayBuffer))
-  //           .map((b) => b.toString(16).padStart(2, "0"))
-  //           .join("");
-
-  //         const websocket = new WebSocket("ws://localhost:8000/ws/voice");
-  //         setWs(websocket);
-
-  //         websocket.onopen = () => {
-  //           websocket.send(
-  //             JSON.stringify({
-  //               audio: audioHex,
-  //               timezone: selectedTimezone,
-  //             })
-  //           );
-  //         };
-
-  //         websocket.onmessage = (event) => {
-  //           const data = JSON.parse(event.data);
-  //           if (data.error) {
-  //             setTranscription(`Error: ${data.message || data.error}`);
-  //             toast.error(data.message || "Voice command failed");
-  //           } else if (data.status === "scheduled") {
-  //             setTranscription(
-  //               `Meeting scheduled: ${data.event.title} at ${
-  //                 data.event.start
-  //               } (${selectedTimezone})${
-  //                 data.event.location ? ` at ${data.event.location}` : ""
-  //               }`
-  //             );
-  //             toast.success("Meeting scheduled successfully");
-  //             setMeetings((prev) => [...prev, formatMeeting(data.event)]);
-  //           } else if (data.status === "conflict") {
-  //             setTranscription(
-  //               `${data.event.message}. Suggested: ${data.event.suggested_start} to ${data.event.suggested_end} (${selectedTimezone})`
-  //             );
-  //             toast.warning("Scheduling conflict detected");
-  //           } else if (data.status === "missing_info") {
-  //             setTranscription(data.event.message);
-  //             toast.info("Additional information needed");
-  //           }
-
-  //           if (data.audio) {
-  //             playAudioResponse(data.audio);
-  //           }
-  //         };
-
-  //         websocket.onerror = () => {
-  //           setTranscription("Connection error. Please try again.");
-  //           toast.error("Voice connection failed");
-  //           setIsRecording(false);
-  //         };
-
-  //         websocket.onclose = () => {
-  //           setWs(null);
-  //         };
-  //       };
-
-  //       recorder.start();
-  //       setIsRecording(true);
-  //       setTranscription("Listening...");
-  //       toast.info("Listening for voice commands...");
-  //     } catch (error) {
-  //       console.error("Microphone error:", error);
-  //       setTranscription(`Error accessing microphone: ${error}`);
-  //       toast.error("Microphone access denied");
-  //       setIsRecording(false);
-  //     }
-  //   } else {
-  //     stopRecording();
-  //   }
-  // };
-  // const toggleRecording = async () => {
-  //   if (!isRecording) {
-  //     try {
-  //       const stream = await navigator.mediaDevices.getUserMedia({
-  //         audio: true,
-  //       });
-  //       mediaStreamRef.current = stream;
-
-  //       const websocket = new WebSocket("ws://localhost:8000/ws/voice");
-  //       wsRef.current = websocket;
-  //       wsRef.current.binaryType = "arraybuffer";
-
-  //       wsRef.current.onopen = () => {
-  //         websocket.send(
-  //           JSON.stringify({ event: "start", timezone: selectedTimezone })
-  //         );
-
-  //         // const recorder = new MediaRecorder(stream, { mimeType: "audio/webm" });
-  //         const recorder = new MediaRecorder(stream, {
-  //           mimeType: "audio/ogg;codecs=opus",
-  //         });
-  //         mediaRecorderRef.current = recorder;
-
-  //         recorder.ondataavailable = (event) => {
-  //           if (event.data.size > 0) {
-  //             event.data.arrayBuffer().then((buffer) => {
-  //               websocket.send(buffer);
-  //             });
-  //           }
-  //         };
-
-  //         recorder.start(250); // chunks every 250ms
-  //         setIsRecording(true);
-  //       };
-  //       wsRef.current.onmessage = (event) => {
-  //         const data = JSON.parse(event.data);
-  //         if (data.error) {
-  //           setTranscription(`Error: ${data.message || data.error}`);
-  //           toast.error(data.message || "Voice command failed");
-  //         } else if (data.status === "scheduled") {
-  //           setTranscription(
-  //             `Meeting scheduled: ${data.event.title} at ${
-  //               data.event.start
-  //             } (${selectedTimezone})${
-  //               data.event.location ? ` at ${data.event.location}` : ""
-  //             }`
-  //           );
-  //           toast.success("Meeting scheduled successfully");
-  //           setMeetings((prev) => [...prev, formatMeeting(data.event)]);
-  //         } else if (data.status === "conflict") {
-  //           setTranscription(
-  //             `${data.event.message}. Suggested: ${data.event.suggested_start} to ${data.event.suggested_end} (${selectedTimezone})`
-  //           );
-  //           toast.warning("Scheduling conflict detected");
-  //         } else if (data.status === "missing_info") {
-  //           setTranscription(data.event.message);
-  //           toast.info("Additional information needed");
-  //         }
-
-  //         if (data.audio) {
-  //           playAudioResponse(data.audio);
-  //         }
-  //         if (data.exit || data.final) {
-  //           wsRef.current?.close();
-  //           wsRef.current = null;
-  //         }
-  //       };
-
-  //       wsRef.current.onerror = () => {
-  //         setTranscription("Connection error. Please try again.");
-  //         toast.error("Voice connection failed");
-  //         setIsRecording(false);
-  //       };
-
-  //       wsRef.current.onclose = () => {
-  //         console.log("WebSocket connection closed");
-  //       };
-  //     } catch (err) {
-  //       console.error("Mic error:", err);
-  //     }
-  //   } else {
-  //     stopRecording();
-  //   }
-  // };
-
-  // const stopRecording = () => {
-  //   console.log("Stopping recording...");
-  //   if (
-  //     mediaRecorderRef.current &&
-  //     mediaRecorderRef.current.state !== "inactive"
-  //   ) {
-  //     mediaRecorderRef.current.stop();
-  //   }
-
-  //   if (wsRef.current) {
-  //     wsRef.current.send(JSON.stringify({ event: "end" }));
-  //     // wsRef.current.close();
-  //     // wsRef.current = null;
-  //   }
-
-  //   if (mediaStreamRef.current) {
-  //     mediaStreamRef.current.getTracks().forEach((track) => track.stop());
-  //     mediaStreamRef.current = null;
-  //   }
-
-  //   setIsRecording(false);
-  // };
-  const toggleRecording = async () => {
-    if (!isRecording) {
-      try {
-        console.log("🎤 Starting recording...");
-        const stream = await navigator.mediaDevices.getUserMedia({
-          audio: {
-            sampleRate: 16000,
-            channelCount: 1,
-            echoCancellation: true,
-            noiseSuppression: true,
-          },
-        });
-        mediaStreamRef.current = stream;
-
-        const websocket = new WebSocket("ws://localhost:8000/ws/voice");
-        wsRef.current = websocket;
-        wsRef.current.binaryType = "arraybuffer";
-
-        wsRef.current.onopen = () => {
-          console.log("🔌 WebSocket connected");
-
-          // Send start event
-          websocket.send(
-            JSON.stringify({
-              event: "start",
-              timezone: selectedTimezone,
-            })
-          );
-          console.log("📨 Sent start event with timezone:", selectedTimezone);
-
-          // Try WAV format first (best for real-time processing)
-          let mimeType = "audio/wav";
-          if (!MediaRecorder.isTypeSupported(mimeType)) {
-            // Fallback to WebM with longer chunks
-            mimeType = "audio/webm;codecs=opus";
-            console.log("⚠️ WAV not supported, falling back to WebM");
-          }
-
-          const recorder = new MediaRecorder(stream, {
-            mimeType,
-            audioBitsPerSecond: 128000, // Ensure consistent bitrate
-          });
-          mediaRecorderRef.current = recorder;
-
-          // Store chunks to send complete audio segments
-          const audioChunks: BlobPart[] | undefined = [];
-          let chunkCount = 0;
-
-          recorder.ondataavailable = (event) => {
-            console.log("🎵 Audio data available:", event.data.size, "bytes");
-
-            if (event.data.size > 0) {
-              audioChunks.push(event.data);
-              chunkCount++;
-
-              // For WAV, send immediately; for WebM/OGG, accumulate chunks
-              if (mimeType === "audio/wav") {
-                sendAudioChunk(event.data, websocket);
-              } else {
-                // Send accumulated chunks every few iterations for container formats
-                if (chunkCount % 4 === 0) {
-                  // Every ~1 second for 250ms chunks
-                  const combinedBlob = new Blob(audioChunks, {
-                    type: mimeType,
-                  });
-                  sendAudioChunk(combinedBlob, websocket);
-                  audioChunks.length = 0; // Clear array
-                }
-              }
-            }
-          };
-
-          const sendAudioChunk = (audioBlob: Blob, websocket: WebSocket) => {
-            if (websocket.readyState === WebSocket.OPEN) {
-              audioBlob
-                .arrayBuffer()
-                .then((buffer) => {
-                  console.log(
-                    "📤 Sending audio chunk:",
-                    buffer.byteLength,
-                    "bytes"
-                  );
-                  // Add format header for backend processing
-                  const formatHeader = new TextEncoder().encode(
-                    mimeType + "\n"
-                  );
-                  const combinedBuffer = new ArrayBuffer(
-                    formatHeader.length + buffer.byteLength
-                  );
-                  const combinedArray = new Uint8Array(combinedBuffer);
-                  combinedArray.set(formatHeader, 0);
-                  combinedArray.set(
-                    new Uint8Array(buffer),
-                    formatHeader.length
-                  );
-
-                  websocket.send(combinedBuffer);
-                })
-                .catch((error: any) => {
-                  console.error("❌ Error converting audio to buffer:", error);
-                });
-            }
-          };
-
-          recorder.onstart = () => {
-            console.log("▶️ MediaRecorder started");
-          };
-
-          recorder.onstop = () => {
-            console.log("⏹️ MediaRecorder stopped");
-            // Send any remaining chunks for container formats
-            if (audioChunks.length > 0 && mimeType !== "audio/wav") {
-              const finalBlob = new Blob(audioChunks, { type: mimeType });
-              sendAudioChunk(finalBlob, websocket);
-            }
-          };
-
-          recorder.onerror = (event) => {
-            console.error("❌ MediaRecorder error:", event.error);
-          };
-
-          // Use appropriate chunk size based on format
-          const chunkDuration = mimeType === "audio/wav" ? 250 : 1000;
-          recorder.start(chunkDuration);
-          console.log(`🎙️ Recording started with ${chunkDuration}ms chunks`);
-          setIsRecording(true);
-        };
-
-        // ... rest of your WebSocket handlers remain the same
-        wsRef.current.onmessage = (event) => {
-          // ... your existing message handling code
-        };
-
-        wsRef.current.onerror = (error) => {
-          console.error("❌ WebSocket error:", error);
-          setTranscription("Connection error. Please try again.");
-          toast.error("Voice connection failed");
-          setIsRecording(false);
-        };
-
-        wsRef.current.onclose = (event) => {
-          console.log(
-            "🔌 WebSocket connection closed:",
-            event.code,
-            event.reason
-          );
-          setIsRecording(false);
-        };
-      } catch (err) {
-        console.error("❌ Microphone access error:", err);
-        toast.error("Could not access microphone");
-        setIsRecording(false);
-      }
-    } else {
-      stopRecording();
-    }
-  };
-  const stopRecording = () => {
-    console.log("⏹️ Stopping recording...");
-
-    // Stop MediaRecorder first
-    if (
-      mediaRecorderRef.current &&
-      mediaRecorderRef.current.state !== "inactive"
-    ) {
-      mediaRecorderRef.current.stop();
-      console.log("📹 MediaRecorder stopped");
-    }
-
-    // Send end event to server
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify({ event: "end" }));
-      console.log("📨 Sent end event");
-
-      // Give server time to process, then close
-      setTimeout(() => {
-        if (wsRef.current) {
-          wsRef.current.close();
-          wsRef.current = null;
-        }
-      }, 100);
-    }
-
-    // Stop media stream
-    if (mediaStreamRef.current) {
-      mediaStreamRef.current.getTracks().forEach((track) => {
-        track.stop();
-        console.log("🎵 Audio track stopped");
-      });
-      mediaStreamRef.current = null;
-    }
-
-    setIsRecording(false);
-  };
-  // const stopRecording = () => {
-  //   if (mediaRecorder && mediaRecorder.state !== "inactive") {
-  //     mediaRecorder.stop();
-
   //   }
 
   //   if (audioContextRef.current.state === "suspended") {
@@ -1299,7 +816,6 @@ const VoiceAssistant: React.FC<VoiceAssistantProps> = ({
   const stopRecording = async () => {
     if (!isRecording) return;
 
-
     try {
       console.log("⏹️ Stopping enhanced recording...");
 
@@ -1335,62 +851,6 @@ const VoiceAssistant: React.FC<VoiceAssistantProps> = ({
       addMessage("🚫 Recording cancelled");
     } catch (error) {
       console.error("❌ Cancel recording error:", error);
-
-  const playAudioResponse = (hexAudio: string) => {
-    try {
-      console.log("🔊 Playing audio response, hex length:", hexAudio.length);
-
-      // Convert hex string back to binary
-      const audioBytes = new Uint8Array(
-        hexAudio.match(/.{1,2}/g)!.map((byte) => parseInt(byte, 16))
-      );
-
-      console.log(`🎵 Audio bytes: ${audioBytes.length} bytes`);
-
-      // Create audio blob and play
-      const audioBlob = new Blob([audioBytes], { type: "audio/wav" });
-      const audioUrl = URL.createObjectURL(audioBlob);
-      const audio = new Audio(audioUrl);
-
-      // Add event listeners for debugging
-      audio.onloadeddata = () => console.log("✅ Audio loaded successfully");
-      audio.onerror = (e) => console.error("❌ Audio load error:", e);
-
-      audio
-        .play()
-        .then(() => {
-          console.log("🔊 Audio played successfully");
-        })
-        .catch((error) => {
-          console.error("❌ Audio playback failed:", error);
-
-          // Fallback: try with generic audio type
-          const fallbackBlob = new Blob([audioBytes], { type: "audio/*" });
-          const fallbackUrl = URL.createObjectURL(fallbackBlob);
-          const fallbackAudio = new Audio(fallbackUrl);
-
-          fallbackAudio.play().catch((fallbackErr) => {
-            console.error(
-              "❌ Fallback audio playback also failed:",
-              fallbackErr
-            );
-          });
-
-          // Clean up fallback URL
-          setTimeout(() => URL.revokeObjectURL(fallbackUrl), 1000);
-        });
-
-      // Clean up URL after audio ends
-      audio.onended = () => {
-        console.log("🔊 Audio playback completed");
-        URL.revokeObjectURL(audioUrl);
-      };
-
-      // Also clean up URL after timeout as safety net
-      setTimeout(() => URL.revokeObjectURL(audioUrl), 5000);
-    } catch (error) {
-      console.error("❌ Audio processing failed:", error);
-
     }
   };
 
@@ -1617,167 +1077,9 @@ const VoiceAssistant: React.FC<VoiceAssistantProps> = ({
           >
             {connectionStatus} {isConnected ? "🟢" : "🔴"}
           </div>
-
           <div style={{ fontSize: "0.9rem", color: "#666" }}>
             Quality: {getConnectionQuality()} | Session:{" "}
             {sessionId.slice(-8) || "N/A"}
-
-        </div>
-      </header>
-
-      <div className="container mx-auto px-6 py-8">
-        <div className="grid lg:grid-cols-3 gap-8">
-          <div className="lg:col-span-2 space-y-6">
-            <Card className="border-0 shadow-xl bg-white/70 backdrop-blur-sm hover:shadow-2xl transition-all duration-500">
-              <CardHeader className="text-center pb-6">
-                <CardTitle className="text-2xl font-semibold text-slate-800">
-                  Voice Assistant
-                </CardTitle>
-                <p className="text-slate-600">
-                  Speak naturally to schedule or manage your meetings
-                </p>
-              </CardHeader>
-              <CardContent className="space-y-8">
-                <div className="flex justify-center">
-                  <div className="relative">
-                    <Button
-                      onClick={toggleRecording}
-                      size="lg"
-                      className={`w-24 h-24 rounded-full transition-all duration-300 ${
-                        isRecording
-                          ? "bg-gradient-to-r from-red-500 to-red-600 hover:from-red-600 hover:to-red-700 shadow-lg shadow-red-500/25"
-                          : "bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-700 hover:to-indigo-700 shadow-lg shadow-blue-500/25"
-                      } hover:scale-105 active:scale-95`}
-                    >
-                      {isRecording ? (
-                        <MicOff className="w-8 h-8 text-white" />
-                      ) : (
-                        <Mic className="w-8 h-8 text-white" />
-                      )}
-                    </Button>
-
-                    {isRecording && (
-                      <>
-                        <div className="absolute inset-0 rounded-full border-4 border-red-400 animate-ping opacity-75"></div>
-                        <div className="absolute inset-0 rounded-full border-2 border-red-300 animate-pulse"></div>
-                        <div className="absolute -inset-4 rounded-full border border-red-200 animate-ping animation-delay-300"></div>
-                      </>
-                    )}
-                  </div>
-                </div>
-                <Button
-                  onClick={stopRecording}
-                  size="lg"
-                  className={`w-24 h-24 rounded-full transition-all duration-300 `}
-                >
-                  stop
-                </Button>
-                <div className="grid md:grid-cols-3 gap-4">
-                  <div className="space-y-2">
-                    <label className="text-sm font-medium text-slate-700 flex items-center gap-2">
-                      <Volume2 className="w-4 h-4" />
-                      Voice Selection
-                    </label>
-                    <Select
-                      value={selectedVoice}
-                      onValueChange={setSelectedVoice}
-                    >
-                      <SelectTrigger className="border-slate-200 hover:border-slate-300 transition-colors">
-                        <SelectValue />
-                      </SelectTrigger>
-                      <SelectContent>
-                        {voices.map((voice) => (
-                          <SelectItem key={voice.value} value={voice.value}>
-                            {voice.label}
-                          </SelectItem>
-                        ))}
-                      </SelectContent>
-                    </Select>
-                  </div>
-                  <div className="space-y-2">
-                    <label className="text-sm font-medium text-slate-700 flex items-center gap-2">
-                      <Globe className="w-4 h-4" />
-                      Timezone
-                    </label>
-                    <Select
-                      value={selectedTimezone}
-                      onValueChange={setSelectedTimezone}
-                    >
-                      <SelectTrigger className="border-slate-200 hover:border-slate-300 transition-colors">
-                        <SelectValue />
-                      </SelectTrigger>
-                      <SelectContent>
-                        {timezones.map((timezone) => (
-                          <SelectItem
-                            key={timezone.value}
-                            value={timezone.value}
-                          >
-                            {timezone.label}
-                          </SelectItem>
-                        ))}
-                      </SelectContent>
-                    </Select>
-                  </div>
-                  <div className="space-y-2">
-                    <label className="text-sm font-medium text-slate-700">
-                      Status
-                    </label>
-                    <div
-                      className={`px-3 py-2 rounded-md text-sm font-medium transition-all duration-300 ${
-                        isRecording
-                          ? "bg-red-50 text-red-700 border border-red-200"
-                          : "bg-slate-50 text-slate-600 border border-slate-200"
-                      }`}
-                    >
-                      {isRecording ? "Listening..." : "Ready to listen"}
-                    </div>
-                  </div>
-                </div>
-                <div className="space-y-3">
-                  <label className="text-sm font-medium text-slate-700">
-                    Live Transcription
-                  </label>
-                  <div className="min-h-[100px] p-4 bg-slate-50 rounded-lg border border-slate-200">
-                    {transcription ? (
-                      <p className="text-slate-800 animate-fade-in">
-                        {transcription}
-                      </p>
-                    ) : (
-                      <p className="text-slate-400 italic">
-                        Transcription will appear here when you start
-                        speaking...
-                      </p>
-                    )}
-                  </div>
-                </div>
-              </CardContent>
-            </Card>
-            <Card className="border-0 shadow-lg bg-white/70 backdrop-blur-sm hover:shadow-xl transition-all duration-300">
-              <CardHeader>
-                <CardTitle className="text-lg font-semibold text-slate-800 flex items-center gap-2">
-                  <Mic className="w-5 h-5" />
-                  Voice Commands
-                </CardTitle>
-              </CardHeader>
-              <CardContent>
-                <div className="grid md:grid-cols-2 gap-4">
-                  {voiceCommands.map((cmd, index) => (
-                    <div
-                      key={index}
-                      className="p-3 bg-slate-50 rounded-lg border border-slate-200 hover:bg-slate-100 transition-colors"
-                    >
-                      <p className="font-medium text-slate-800">
-                        "{cmd.command}"
-                      </p>
-                      <p className="text-sm text-slate-600">
-                        {cmd.description}
-                      </p>
-                    </div>
-                  ))}
-                </div>
-              </CardContent>
-            </Card>
-
           </div>
           {!isConnected && (
             <button
