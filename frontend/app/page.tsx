@@ -513,11 +513,12 @@ const VoiceAssistant: React.FC<VoiceAssistantProps> = ({
       // Handle audio data chunks - RACE CONDITION FIX
       const audioChunks: Blob[] = []; // Add this outside the handler
 
+      let totalSentChunks = 0;
+
       recorder.ondataavailable = async (event) => {
         console.log(`📥 MediaRecorder chunk: ${event.data.size} bytes`);
 
         if (event.data.size > 0) {
-          // Simply accumulate all chunks - don't try to decode yet
           audioChunks.push(event.data);
           audioChunkCountRef.current++;
 
@@ -525,11 +526,9 @@ const VoiceAssistant: React.FC<VoiceAssistantProps> = ({
             `📦 Accumulated chunk ${audioChunkCountRef.current}: ${event.data.size} bytes`
           );
 
-          // If we have multiple chunks, combine and process them
-          if (audioChunks.length >= 2) {
-            // Process every 2 chunks for better success rate
+          // Try to process chunks every 3-4 accumulated chunks
+          if (audioChunks.length >= 3) {
             try {
-              // Combine accumulated chunks into one blob
               const combinedBlob = new Blob(audioChunks, {
                 type: audioChunks[0].type,
               });
@@ -540,31 +539,37 @@ const VoiceAssistant: React.FC<VoiceAssistantProps> = ({
               );
 
               try {
-                // Try to decode the combined blob
+                // Try to decode the combined audio
                 const audioBuffer =
-                  await audioContextRef.current!.decodeAudioData(arrayBuffer);
+                  await audioContextRef.current!.decodeAudioData(
+                    arrayBuffer.slice(0)
+                  );
                 const channelData = audioBuffer.getChannelData(0);
                 const pcmData = convertToPCM16Enhanced(channelData);
 
                 // Send to backend
                 if (wsRef.current?.readyState === WebSocket.OPEN) {
                   wsRef.current.send(pcmData);
+                  totalSentChunks++;
                   console.log(
-                    `📡 Sent combined chunk: ${pcmData.byteLength} bytes`
+                    `📡 Sent chunk ${totalSentChunks}: ${pcmData.byteLength} bytes`
                   );
                 }
 
-                // Clear processed chunks
-                audioChunks.length = 0;
+                // Clear only the processed chunks (keep last 1 for continuity)
+                audioChunks.splice(0, audioChunks.length - 1);
               } catch (decodeError) {
                 console.log(
-                  `⚠️ Combined chunk still incomplete, keeping for next batch`
+                  `⚠️ Decode failed, keeping chunks for bigger batch`
                 );
-                // Keep chunks for next combination attempt
+                // Don't clear chunks - let them accumulate for next attempt
+                if (audioChunks.length > 10) {
+                  // Prevent memory overflow - clear oldest chunks
+                  audioChunks.splice(0, 5);
+                }
               }
             } catch (error) {
               console.error("❌ Processing error:", error);
-              audioChunks.length = 0; // Clear on error
             }
           }
         }
@@ -576,6 +581,7 @@ const VoiceAssistant: React.FC<VoiceAssistantProps> = ({
       };
 
       // Also handle final chunks when recording stops
+      // IMPORTANT: Process final chunks when recording stops
       recorder.onstop = async () => {
         console.log("⏹️ MediaRecorder stopped - processing final chunks");
 
@@ -600,10 +606,9 @@ const VoiceAssistant: React.FC<VoiceAssistantProps> = ({
             console.error("❌ Final chunk processing failed:", error);
           }
 
-          audioChunks.length = 0; // Clear
+          audioChunks.length = 0;
         }
       };
-
       recorder.onstart = () => {
         console.log("▶️ MediaRecorder started");
       };
