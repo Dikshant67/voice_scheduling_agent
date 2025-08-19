@@ -15,6 +15,7 @@ class TextToVoice:
             speechsdk.SpeechSynthesisOutputFormat.Riff16Khz16BitMonoPcm
         )
         
+        
         self.logger = logging.getLogger(__name__)
 
     def synthesize(self, text: str) -> bytes:
@@ -26,14 +27,14 @@ class TextToVoice:
             self.logger.info(f"🗣️ Synthesizing: {text}")
             
             # Create synthesizer with explicit audio config for better control
-            audio_config = speechsdk.audio.AudioOutputConfig(use_default_speaker=True)
+            # audio_config = speechsdk.audio.AudioOutputConfig(use_default_speaker=True)
             synthesizer = speechsdk.SpeechSynthesizer(
                 speech_config=self.speech_config, 
-                audio_config=audio_config
+                audio_config=None
             )
             
             result = synthesizer.speak_text_async(text).get()
-            
+            synthesizer.stop_speaking_async().get()  # Ensure we stop any ongoing speech
             if result.reason == speechsdk.ResultReason.SynthesizingAudioCompleted:
                 self.logger.info(f"✅ Speech synthesis completed. Audio size: {len(result.audio_data)} bytes")
                 return result.audio_data

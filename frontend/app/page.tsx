@@ -57,6 +57,7 @@ const VoiceAssistant: React.FC<VoiceAssistantProps> = ({
   const [transcription, setTranscription] = useState<string>("");
   const [connectionStatus, setConnectionStatus] =
     useState<string>("Disconnected");
+  const [isConnecting, setIsConnecting] = useState(false);
   const [audioFeedback, setAudioFeedback] = useState<AudioFeedback | null>(
     null
   );
@@ -96,7 +97,7 @@ const VoiceAssistant: React.FC<VoiceAssistantProps> = ({
   // Enhanced WebSocket connection with auto-reconnect
   const connectWebSocket = useCallback(() => {
     try {
-      if (wsRef.current?.readyState === WebSocket.OPEN) {
+      if (isConnecting || wsRef.current?.readyState === WebSocket.OPEN) {
         console.log("🔗 WebSocket already connected");
         return;
       }
@@ -109,6 +110,7 @@ const VoiceAssistant: React.FC<VoiceAssistantProps> = ({
       wsRef.current.onopen = () => {
         console.log("✅ WebSocket connected successfully");
         setIsConnected(true);
+        setIsConnecting(false);
         setConnectionStatus("Connected");
         sessionStartTimeRef.current = Date.now();
         addMessage("🟢 Connected to enhanced voice assistant");
@@ -141,6 +143,7 @@ const VoiceAssistant: React.FC<VoiceAssistantProps> = ({
         setConnectionStatus("Disconnected");
         setIsRecording(false);
         setIsProcessing(false);
+        setIsConnecting(false);
         addMessage(`🔴 Disconnected (Code: ${event.code})`);
 
         // Auto-reconnect if enabled and not a clean close
@@ -153,6 +156,7 @@ const VoiceAssistant: React.FC<VoiceAssistantProps> = ({
         console.error("💥 WebSocket error:", error);
         setConnectionStatus("Connection Error");
         addMessage("❌ Connection error occurred");
+        setIsConnecting(false);
 
         if (autoReconnect) {
           scheduleReconnect();
@@ -165,7 +169,7 @@ const VoiceAssistant: React.FC<VoiceAssistantProps> = ({
         scheduleReconnect();
       }
     }
-  }, [websocketUrl, autoReconnect]);
+  }, [websocketUrl, autoReconnect, isConnecting]);
 
   // Auto-reconnect mechanism
   const scheduleReconnect = useCallback(() => {
@@ -515,80 +519,85 @@ const VoiceAssistant: React.FC<VoiceAssistantProps> = ({
 
       let totalSentChunks = 0;
 
+      // recorder.ondataavailable = async (event) => {
+      //   console.log(`📥 MediaRecorder chunk: ${event.data.size} bytes`);
+
+      //   if (event.data.size > 0) {
+      //     audioChunks.push(event.data);
+      //     audioChunkCountRef.current++;
+
+      //     console.log(
+      //       `📦 Accumulated chunk ${audioChunkCountRef.current}: ${event.data.size} bytes`
+      //     );
+
+      //     // Try to process chunks every 3-4 accumulated chunks
+      //     if (audioChunks.length >= 3) {
+      //       try {
+      //         const combinedBlob = new Blob(audioChunks, {
+      //           type: audioChunks[0].type,
+      //         });
+      //         const arrayBuffer = await combinedBlob.arrayBuffer();
+
+      //         console.log(
+      //           `🔄 Processing combined ${arrayBuffer.byteLength} bytes`
+      //         );
+
+      //         try {
+      //           // Try to decode the combined audio
+      //           const audioBuffer =
+      //             await audioContextRef.current!.decodeAudioData(
+      //               arrayBuffer.slice(0)
+      //             );
+      //           const channelData = audioBuffer.getChannelData(0);
+      //           const pcmData = convertToPCM16Enhanced(channelData);
+
+      //           // Send to backend
+      //           if (wsRef.current?.readyState === WebSocket.OPEN) {
+      //             wsRef.current.send(pcmData);
+      //             totalSentChunks++;
+      //             console.log(
+      //               `📡 Sent chunk ${totalSentChunks}: ${pcmData.byteLength} bytes`
+      //             );
+      //           }
+
+      //           // Clear only the processed chunks (keep last 1 for continuity)
+      //           audioChunks.splice(0, audioChunks.length - 1);
+      //         } catch (decodeError) {
+      //           console.log(
+      //             `⚠️ Decode failed, keeping chunks for bigger batch`
+      //           );
+      //           // Don't clear chunks - let them accumulate for next attempt
+      //           if (audioChunks.length > 10) {
+      //             // Prevent memory overflow - clear oldest chunks
+      //             audioChunks.splice(0, 5);
+      //           }
+      //         }
+      //       } catch (error) {
+      //         console.error("❌ Processing error:", error);
+      //       }
+      //     }
+      //   }
+      // };
+      // Simplified approach - send complete audio only at the end
+      const allAudioChunks: Blob[] = [];
+
       recorder.ondataavailable = async (event) => {
-        console.log(`📥 MediaRecorder chunk: ${event.data.size} bytes`);
-
         if (event.data.size > 0) {
-          audioChunks.push(event.data);
-          audioChunkCountRef.current++;
-
+          allAudioChunks.push(event.data);
           console.log(
-            `📦 Accumulated chunk ${audioChunkCountRef.current}: ${event.data.size} bytes`
+            `📦 Accumulated chunk ${allAudioChunks.length}: ${event.data.size} bytes`
           );
-
-          // Try to process chunks every 3-4 accumulated chunks
-          if (audioChunks.length >= 3) {
-            try {
-              const combinedBlob = new Blob(audioChunks, {
-                type: audioChunks[0].type,
-              });
-              const arrayBuffer = await combinedBlob.arrayBuffer();
-
-              console.log(
-                `🔄 Processing combined ${arrayBuffer.byteLength} bytes`
-              );
-
-              try {
-                // Try to decode the combined audio
-                const audioBuffer =
-                  await audioContextRef.current!.decodeAudioData(
-                    arrayBuffer.slice(0)
-                  );
-                const channelData = audioBuffer.getChannelData(0);
-                const pcmData = convertToPCM16Enhanced(channelData);
-
-                // Send to backend
-                if (wsRef.current?.readyState === WebSocket.OPEN) {
-                  wsRef.current.send(pcmData);
-                  totalSentChunks++;
-                  console.log(
-                    `📡 Sent chunk ${totalSentChunks}: ${pcmData.byteLength} bytes`
-                  );
-                }
-
-                // Clear only the processed chunks (keep last 1 for continuity)
-                audioChunks.splice(0, audioChunks.length - 1);
-              } catch (decodeError) {
-                console.log(
-                  `⚠️ Decode failed, keeping chunks for bigger batch`
-                );
-                // Don't clear chunks - let them accumulate for next attempt
-                if (audioChunks.length > 10) {
-                  // Prevent memory overflow - clear oldest chunks
-                  audioChunks.splice(0, 5);
-                }
-              }
-            } catch (error) {
-              console.error("❌ Processing error:", error);
-            }
-          }
         }
       };
 
-      recorder.onerror = (event) => {
-        console.error("❌ MediaRecorder error:", event);
-        addMessage(`❌ Recording error: ${event}`);
-      };
-
-      // Also handle final chunks when recording stops
-      // IMPORTANT: Process final chunks when recording stops
       recorder.onstop = async () => {
-        console.log("⏹️ MediaRecorder stopped - processing final chunks");
+        console.log("⏹️ Processing all accumulated chunks...");
 
-        if (audioChunks.length > 0) {
+        if (allAudioChunks.length > 0) {
           try {
-            const finalBlob = new Blob(audioChunks, {
-              type: audioChunks[0].type,
+            // Combine ALL chunks at the end
+            const finalBlob = new Blob(allAudioChunks, {
+              type: allAudioChunks[0].type,
             });
             const arrayBuffer = await finalBlob.arrayBuffer();
 
@@ -600,15 +609,51 @@ const VoiceAssistant: React.FC<VoiceAssistantProps> = ({
 
             if (wsRef.current?.readyState === WebSocket.OPEN) {
               wsRef.current.send(pcmData);
-              console.log(`📡 Sent final chunk: ${pcmData.byteLength} bytes`);
+              console.log(
+                `📡 Sent complete recording: ${pcmData.byteLength} bytes`
+              );
             }
           } catch (error) {
-            console.error("❌ Final chunk processing failed:", error);
+            console.error("❌ Complete audio processing failed:", error);
           }
 
-          audioChunks.length = 0;
+          allAudioChunks.length = 0;
         }
       };
+      recorder.onerror = (event) => {
+        console.error("❌ MediaRecorder error:", event);
+        addMessage(`❌ Recording error: ${event}`);
+      };
+
+      // Also handle final chunks when recording stops
+      // IMPORTANT: Process final chunks when recording stops
+      // recorder.onstop = async () => {
+      //   console.log("⏹️ MediaRecorder stopped - processing final chunks");
+
+      //   if (audioChunks.length > 0) {
+      //     try {
+      //       const finalBlob = new Blob(audioChunks, {
+      //         type: audioChunks[0].type,
+      //       });
+      //       const arrayBuffer = await finalBlob.arrayBuffer();
+
+      //       const audioBuffer = await audioContextRef.current!.decodeAudioData(
+      //         arrayBuffer
+      //       );
+      //       const channelData = audioBuffer.getChannelData(0);
+      //       const pcmData = convertToPCM16Enhanced(channelData);
+
+      //       if (wsRef.current?.readyState === WebSocket.OPEN) {
+      //         wsRef.current.send(pcmData);
+      //         console.log(`📡 Sent final chunk: ${pcmData.byteLength} bytes`);
+      //       }
+      //     } catch (error) {
+      //       console.error("❌ Final chunk processing failed:", error);
+      //     }
+
+      //     audioChunks.length = 0;
+      //   }
+      // };
       recorder.onstart = () => {
         console.log("▶️ MediaRecorder started");
       };
