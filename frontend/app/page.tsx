@@ -96,7 +96,10 @@ const VoiceAssistant: React.FC<VoiceAssistantProps> = ({
   // Enhanced WebSocket connection with auto-reconnect
   const connectWebSocket = useCallback(() => {
     try {
-      if (wsRef.current?.readyState === WebSocket.OPEN) {
+      if (
+        wsRef.current?.readyState === WebSocket.CONNECTING ||
+        wsRef.current?.readyState === WebSocket.OPEN
+      ) {
         console.log("🔗 WebSocket already connected");
         return;
       }
@@ -577,33 +580,143 @@ const VoiceAssistant: React.FC<VoiceAssistantProps> = ({
 
       // Also handle final chunks when recording stops
       recorder.onstop = async () => {
-        console.log("⏹️ MediaRecorder stopped - processing final chunks");
+        console.log("⏹️ Processing complete recording...");
 
         if (audioChunks.length > 0) {
           try {
-            const finalBlob = new Blob(audioChunks, {
-              type: audioChunks[0].type,
-            });
-            const arrayBuffer = await finalBlob.arrayBuffer();
+            // Send start signal
+            if (wsRef.current?.readyState === WebSocket.OPEN) {
+              wsRef.current.send(
+                JSON.stringify({
+                  event: "start_processing",
+                  timezone: timezone,
+                })
+              );
+            }
 
-            const audioBuffer = await audioContextRef.current!.decodeAudioData(
+            // Create blob from WebM chunks
+            const audioBlob = new Blob(audioChunks, { type: mimeType });
+            console.log(`📦 Created blob: ${audioBlob.size} bytes`);
+
+            // **CRITICAL FIX**: Proper PCM conversion
+            if (!audioContextRef.current) {
+              audioContextRef.current = new (window.AudioContext ||
+                (window as any).webkitAudioContext)({ sampleRate: 16000 }); // Force 16kHz
+            }
+
+            if (audioContextRef.current.state === "suspended") {
+              await audioContextRef.current.resume();
+            }
+
+            // Convert WebM to PCM properly
+            const arrayBuffer = await audioBlob.arrayBuffer();
+            console.log(`🔄 Converting ${arrayBuffer.byteLength} bytes to PCM`);
+
+            const audioBuffer = await audioContextRef.current.decodeAudioData(
               arrayBuffer
             );
+            console.log(
+              `✅ Decoded: ${audioBuffer.duration}s, ${audioBuffer.sampleRate}Hz`
+            );
+
+            // Get clean mono audio data
             const channelData = audioBuffer.getChannelData(0);
-            const pcmData = convertToPCM16Enhanced(channelData);
+
+            // **FIX**: Ensure exactly 16kHz output
+            let finalChannelData = channelData;
+            if (audioBuffer.sampleRate !== 16000) {
+              console.log(
+                `🔄 Resampling from ${audioBuffer.sampleRate}Hz to 16kHz`
+              );
+              finalChannelData = resampleTo16kHz(
+                channelData,
+                audioBuffer.sampleRate
+              );
+            }
+
+            // Convert to clean 16-bit PCM
+            const pcmData = convertToCleanPCM16(finalChannelData);
+            console.log(`📡 Sending clean PCM: ${pcmData.byteLength} bytes`);
 
             if (wsRef.current?.readyState === WebSocket.OPEN) {
               wsRef.current.send(pcmData);
-              console.log(`📡 Sent final chunk: ${pcmData.byteLength} bytes`);
+              addMessage(
+                `📡 Sent clean audio: ${(pcmData.byteLength / 1024).toFixed(
+                  1
+                )} KB`
+              );
+            }
+
+            // Send end signal
+            if (wsRef.current?.readyState === WebSocket.OPEN) {
+              wsRef.current.send(JSON.stringify({ event: "end_processing" }));
             }
           } catch (error) {
-            console.error("❌ Final chunk processing failed:", error);
+            console.error("❌ Audio conversion error:", error);
+            addMessage("❌ Failed to convert audio");
           }
-
-          audioChunks.length = 0; // Clear
         }
+
+        audioChunks.length = 0;
+      };
+      const convertToCleanPCM16 = (inputData: Float32Array): ArrayBuffer => {
+        const length = inputData.length;
+        const result = new Int16Array(length);
+
+        // Calculate RMS to determine volume boost needed
+        const rms = Math.sqrt(
+          inputData.reduce((sum, sample) => sum + sample * sample, 0) / length
+        );
+        console.log(`🔊 Original RMS: ${rms}`);
+
+        // Apply volume boost if audio is too quiet
+        let volumeBoost = 1.0;
+        if (rms < 0.01) {
+          volumeBoost = 10.0; // Boost very quiet audio
+          console.log(`🔊 Applying volume boost: ${volumeBoost}x`);
+        } else if (rms < 0.05) {
+          volumeBoost = 3.0; // Moderate boost
+          console.log(`🔊 Applying volume boost: ${volumeBoost}x`);
+        }
+
+        for (let i = 0; i < length; i++) {
+          let sample = inputData[i] * volumeBoost;
+
+          // Clamp to prevent distortion
+          sample = Math.max(-1.0, Math.min(1.0, sample));
+
+          // Convert to 16-bit PCM
+          const pcmSample = sample < 0 ? sample * 0x8000 : sample * 0x7fff;
+          result[i] = Math.floor(pcmSample);
+        }
+
+        console.log(
+          `🔄 Converted ${length} samples with ${volumeBoost}x boost`
+        );
+        return result.buffer;
       };
 
+      // **NEW**: Simple resampling to 16kHz
+      const resampleTo16kHz = (
+        inputData: Float32Array,
+        originalSampleRate: number
+      ): Float32Array => {
+        if (originalSampleRate === 16000) return inputData;
+
+        const ratio = originalSampleRate / 16000;
+        const outputLength = Math.floor(inputData.length / ratio);
+        const output = new Float32Array(outputLength);
+
+        for (let i = 0; i < outputLength; i++) {
+          const srcIndex = Math.floor(i * ratio);
+          output[i] = inputData[srcIndex];
+        }
+
+        console.log(
+          `🔄 Resampled: ${inputData.length} → ${outputLength} samples`
+        );
+        return output;
+      };
       recorder.onstart = () => {
         console.log("▶️ MediaRecorder started");
       };

@@ -454,6 +454,83 @@ async def silence_timeout(websocket: WebSocket, session: dict, delay: float):
         logger.debug(f"🔇 Silence timer cancelled for {session['id']}")
     except Exception as e:
         logger.error(f"💥 Error in silence timeout for {session['id']}: {e}")
+async def send_audio_response(websocket: WebSocket, text: str, response_type: str, 
+                            session: dict, extra_data: dict = None):
+    """Enhanced audio response with better synthesis and error handling"""
+    try:
+        response_data = {
+            "type": response_type,
+            "message": text,
+            "session_id": session['id'],
+            "timestamp": datetime.now().isoformat()
+        }
+        
+        if extra_data:
+            response_data.update(extra_data)
+        
+        # Enhanced audio synthesis
+        try:
+            audio_response = text_to_voice.synthesize(text)
+            logger.info(f"🔊 Synthesized audio for response [{session['id']}]: {len(audio_response)} bytes")
+            if audio_response and len(audio_response) > 0:
+                response_data["audio"] = audio_response.hex()
+                response_data["audio_duration"] = estimate_audio_duration(audio_response)
+        except Exception as audio_error:
+            logger.warning(f"⚠️ Audio synthesis failed for {session['id']}: {audio_error}")
+            # Continue without audio
+        
+        await websocket.send_json(response_data)
+        logger.info(f"🗣️ Sent response [{session['id']}]: {response_type}")
+        
+    except Exception as e:
+        logger.error(f"💥 Error sending response to {session['id']}: {e}")
+async def save_pcm_as_wav(audio_buffer: bytearray) -> Optional[str]:
+    """Save PCM audio buffer as WAV file with proper headers and clean audio """
+    try:
+        buffer_size = len(audio_buffer)
+        logger.info(f"💾 Creating WAV file from {len(audio_buffer)} bytes of PCM data")
+        if buffer_size == 0:
+            logger.error("❌ Cannot create WAV file: audio buffer is empty!")
+            return None
+        temp_fd, temp_path = tempfile.mkstemp(suffix='.wav', prefix='voice_assistant_')
+        
+        with os.fdopen(temp_fd, 'wb') as f:
+            # Write WAV file using wave module for proper formatting
+            with wave.open(f, 'wb') as wav_file:
+                wav_file.setnchannels(CHANNELS)
+                wav_file.setsampwidth(BYTES_PER_SAMPLE)
+                wav_file.setframerate(SAMPLE_RATE)
+                wav_file.writeframes(audio_buffer)
+                logger.info(f"📝 Writing {len(audio_buffer)} bytes to WAV file")
+                # wav_file.writeframes(audio_buffer)
+        # Verify file was created successfully
+        if os.path.exists(temp_path):
+            file_size = os.path.getsize(temp_path)
+            expected_size = 44 + buffer_size  # 44 bytes for WAV header
+            logger.info(f"📁 Created WAV file: {temp_path} ({file_size} bytes)")
+            if file_size <= 44:  # WAV header is 44 bytes
+                logger.error(f"❌ WAV file is too small ({file_size} bytes) - likely empty!")
+                return None
+            # Verify WAV file is readable
+            try:
+                with wave.open(temp_path, 'rb') as test_wav:
+                    frames = test_wav.getnframes()
+                    duration = frames / test_wav.getframerate()
+                    logger.info(f"📊 WAV verification: {frames} frames, {duration:.2f}s duration")
+                    
+                    if duration < 0.5:
+                        logger.warning(f"⚠️ Very short audio: {duration:.2f}s")
+                    
+            except Exception as verify_error:
+                logger.error(f"❌ WAV verification failed: {verify_error}")
+                return None
+            return temp_path
+        else:
+            logger.error(f"❌ WAV file not created: {temp_path} does not exist")    
+            return None       
+    except Exception as e:
+        logger.error(f"💥 Error saving PCM as WAV: {e}")
+        return None
 
 async def process_complete_audio(websocket: WebSocket, session: dict):
     """Enhanced audio processing with better error handling and optimization"""
@@ -630,6 +707,67 @@ async def process_meeting_scheduling(websocket: WebSocket, entities: dict, sessi
         logger.error(f"💥 Meeting scheduling error for {session['id']}: {str(e)}")
         await send_audio_response(websocket, f"Sorry, scheduling failed: {str(e)}", "error", session)
 # ADD THIS FUNCTION:
+def validate_wav_quality(wav_path: str) -> dict:
+    """Validate WAV file quality before STT processing"""
+    try:
+        with wave.open(wav_path, 'rb') as wav_file:
+            frames = wav_file.getnframes()
+            sample_rate = wav_file.getframerate()
+            channels = wav_file.getnchannels()
+            sample_width = wav_file.getsampwidth()
+            duration = frames / sample_rate
+            
+            # Read a sample of audio data
+            wav_file.rewind()
+            sample_frames = min(frames, sample_rate)  # 1 second max
+            audio_data = wav_file.readframes(sample_frames)
+            
+            # Convert to numpy for analysis
+            audio_samples = np.frombuffer(audio_data, dtype=np.int16)
+            
+            # Calculate quality metrics
+            rms = np.sqrt(np.mean(audio_samples.astype(np.float32)**2))
+            max_amplitude = np.max(np.abs(audio_samples))
+            snr_estimate = 20 * np.log10(max_amplitude / max(rms, 1)) if rms > 0 else 0
+            
+            validation = {
+                'is_valid': True,
+                'duration': duration,
+                'sample_rate': sample_rate,
+                'channels': channels,
+                'sample_width': sample_width,
+                'rms': float(rms),
+                'max_amplitude': int(max_amplitude),
+                'snr_db': float(snr_estimate),
+                'issues': []
+            }
+            
+            # Check for issues
+            if duration < 0.5:
+                validation['issues'].append('Too short')
+            if sample_rate != 16000:
+                validation['issues'].append(f'Wrong sample rate: {sample_rate}Hz')
+            if channels != 1:
+                validation['issues'].append(f'Not mono: {channels} channels')
+            if sample_width != 2:
+                validation['issues'].append(f'Wrong bit depth: {sample_width*8}bit')
+            if rms < 100:
+                validation['issues'].append('Very low volume')
+            if max_amplitude < 1000:
+                validation['issues'].append('Very quiet audio')
+                
+            if validation['issues']:
+                validation['is_valid'] = False
+                
+            return validation
+            
+    except Exception as e:
+        return {
+            'is_valid': False,
+            'error': str(e),
+            'issues': ['File validation failed']
+        }
+
 async def fill_missing_fields_async(entities: dict, text_to_voice, websocket: WebSocket, session: dict) -> dict:
     """Async wrapper for fill_missing_fields function"""
     try:
@@ -653,7 +791,9 @@ async def enhanced_speech_to_text(file_path: str, session: dict) -> str:
     
     try:
         logger.info(f"🎙️ Enhanced STT processing for {session['id']}")
-        
+        # Validate WAV quality first
+        quality = validate_wav_quality(file_path)
+        logger.info(f"📊 Audio quality: {quality}")
         if not os.path.exists(file_path):
             raise Exception(f"Audio file not found: {file_path}")
             
@@ -993,69 +1133,7 @@ def validate_audio_buffer_quality(audio_buffer: bytearray) -> dict:
         logger.error(f"💥 Audio quality validation error: {e}")
         return {'is_valid': False, 'reason': 'Unable to analyze audio quality'}
 
-async def save_pcm_as_wav(audio_buffer: bytearray) -> Optional[str]:
-    """Save PCM audio buffer as WAV file with proper headers"""
-    try:
-        logger.info(f"💾 Creating WAV file from {len(audio_buffer)} bytes of PCM data")
-        if len(audio_buffer) == 0:
-            logger.error("❌ Cannot create WAV file: audio buffer is empty!")
-            return None
-        temp_fd, temp_path = tempfile.mkstemp(suffix='.wav', prefix='voice_assistant_')
-        
-        with os.fdopen(temp_fd, 'wb') as f:
-            # Write WAV file using wave module for proper formatting
-            with wave.open(f, 'wb') as wav_file:
-                wav_file.setnchannels(CHANNELS)
-                wav_file.setsampwidth(BYTES_PER_SAMPLE)
-                wav_file.setframerate(SAMPLE_RATE)
-                wav_file.writeframes(audio_buffer)
-                logger.info(f"📝 Writing {len(audio_buffer)} bytes to WAV file")
-                # wav_file.writeframes(audio_buffer)
-        # Verify file was created successfully
-        if os.path.exists(temp_path):
-            file_size = os.path.getsize(temp_path)
-            logger.info(f"📁 Created WAV file: {temp_path} ({file_size} bytes)")
-            if file_size <= 44:  # WAV header is 44 bytes
-                logger.error(f"❌ WAV file is too small ({file_size} bytes) - likely empty!")
-                return None
-            return temp_path
-        
-        return None
-        
-    except Exception as e:
-        logger.error(f"💥 Error saving PCM as WAV: {e}")
-        return None
 
-async def send_audio_response(websocket: WebSocket, text: str, response_type: str, 
-                            session: dict, extra_data: dict = None):
-    """Enhanced audio response with better synthesis and error handling"""
-    try:
-        response_data = {
-            "type": response_type,
-            "message": text,
-            "session_id": session['id'],
-            "timestamp": datetime.now().isoformat()
-        }
-        
-        if extra_data:
-            response_data.update(extra_data)
-        
-        # Enhanced audio synthesis
-        try:
-            audio_response = text_to_voice.synthesize(text)
-            logger.info(f"🔊 Synthesized audio for response [{session['id']}]: {len(audio_response)} bytes")
-            if audio_response and len(audio_response) > 0:
-                response_data["audio"] = audio_response.hex()
-                response_data["audio_duration"] = estimate_audio_duration(audio_response)
-        except Exception as audio_error:
-            logger.warning(f"⚠️ Audio synthesis failed for {session['id']}: {audio_error}")
-            # Continue without audio
-        
-        await websocket.send_json(response_data)
-        logger.info(f"🗣️ Sent response [{session['id']}]: {response_type}")
-        
-    except Exception as e:
-        logger.error(f"💥 Error sending response to {session['id']}: {e}")
 
 async def send_error_response(websocket: WebSocket, error_message: str, session: dict = None):
     """Send standardized error response"""
