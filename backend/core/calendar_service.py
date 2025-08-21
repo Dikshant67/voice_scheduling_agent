@@ -1,3 +1,4 @@
+import logging
 import os
 import pickle
 from datetime import datetime, timedelta
@@ -9,24 +10,45 @@ from google.oauth2.credentials import Credentials
 import pytz
 from core.validation import is_valid_date, is_valid_time
 from core.timezone_utils import parse_datetime, validate_timezone
-
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')  # Missing closing parenthesis
+logger = logging.getLogger(__name__)
 class CalendarService:
     def __init__(self):
         self.SCOPES = ['https://www.googleapis.com/auth/calendar']
         self.token_path = 'token.pickle'
         self.BUFFER_MINUTES = 15
         self.DEFAULT_MEETING_DURATION = 60  # in minutes
-        self.credentials = self._get_credentials()
+        try:
+            self.credentials = self._get_credentials()  
+            logger.info("Google Calendar service initialized successfully.")
+        except Exception as e:
+            logger.error(f"Failed to initialize Google Calendar service: {str(e)}")
+            raise Exception(f"Failed to initialize Google Calendar service: {str(e)}")
+        
 
     def _get_credentials(self):
-        try:
-            flow = InstalledAppFlow.from_client_secrets_file('./config/credentials.json', self.SCOPES)
-            creds = flow.run_local_server(port=0)
-            with open(self.token_path, 'wb') as token:
-                pickle.dump(creds, token)
-            return creds
-        except Exception as e:
-            raise Exception(f"Authentication failed: {str(e)}")
+        creds = None
+    # Check if token.pickle exists first
+        if os.path.exists(self.token_path):
+            with open(self.token_path, 'rb') as token:
+             creds = pickle.load(token)
+    
+    # If credentials are invalid or don't exist, authenticate
+        if not creds or not creds.valid:
+            if creds and creds.expired and creds.refresh_token:
+                creds.refresh(Request())
+            else:
+             flow = InstalledAppFlow.from_client_secrets_file(
+                './config/credentials.json', self.SCOPES)
+             creds = flow.run_local_server(port=0)
+        
+        # Save credentials for future use
+        with open(self.token_path, 'wb') as token:
+            pickle.dump(creds, token)
+    
+        return creds
+
+
 
     # def fetch_existing_events(self, start_dt, end_dt, timezone='Asia/Kolkata'):
     #     """
@@ -290,7 +312,7 @@ class CalendarService:
                     print(f"Skipping event '{title}' due to invalid date format: {str(e)}")
                     continue
 
-            return formatted_events
+        return formatted_events
 
      except Exception as e:
         raise Exception(f"Error fetching events: {str(e)}")

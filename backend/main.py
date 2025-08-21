@@ -51,7 +51,7 @@ processing_lock = {}
 active_sessions = {}
 
 config = Config()
-calendar_service = CalendarService()
+
 voice_to_text = VoiceToText(config.azure_speech_key, config.azure_speech_region)
 text_to_voice = TextToVoice(config.azure_speech_key, config.azure_speech_region)
 gpt_agent = GPTAgent(config.gpt_api_key)
@@ -1012,8 +1012,14 @@ async def get_availability1(start: str, end: str, timezone: str,entities: dict, 
         await send_error_response(websocket, f"Scheduling failed: {str(e)}")
 
     
-@app.get("/calendar/test1")
+@app.get("/calendar/availability-test")
 async def test_availability(start: str, end: str, timezone: str):
+    global calendar_service
+    calendar_service = CalendarService()
+    if 'calendar_service' not in globals() or calendar_service is None:
+        logger.error("❌ inside availability test _______________calendar_service is not initialized")
+        raise HTTPException(status_code=500, detail="Calendar service not initialized")
+    
     logger.info(f"🔍 GET /calendar/availability called")
     logger.info(f"📅 Parameters: start={start}, end={end}, timezone={timezone}")
     
