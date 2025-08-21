@@ -15,9 +15,9 @@ class GPTAgent:
     api_version=os.getenv("AZURE_OPENAI_API_VERSION"),
     azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"))
         self.logger = logging.getLogger(__name__)
-    now = datetime.datetime.now()
-    date = now.strftime("%Y-%m-%d")  # 2025-08-19
-    time = now.strftime("%H:%M:%S")  # 16:54:30
+        
+        self.date = datetime.datetime.now().strftime("%Y-%m-%d")  # 2025-08-19
+        self.time = datetime.datetime.now().strftime("%H:%M:%S")  # 16:54:30
     
     def process_input(self, text: str) -> tuple[str, dict]:
         try:

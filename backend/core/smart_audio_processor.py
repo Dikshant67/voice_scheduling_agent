@@ -7,7 +7,7 @@ import time
 
 class SmartAudioProcessor:
     def __init__(self):
-        self.silence_threshold = 0.01  
+        self.silence_threshold = 0.1
         self.min_silence_duration = 1.5  
         self.max_recording_duration = 30  
         self.min_speech_duration = 0.8   
