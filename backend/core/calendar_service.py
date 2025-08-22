@@ -40,7 +40,7 @@ class CalendarService:
             else:
              flow = InstalledAppFlow.from_client_secrets_file(
                 './config/credentials.json', self.SCOPES)
-             creds = flow.run_local_server(port=0)
+             creds = flow.run_local_server(port=8080)
         
         # Save credentials for future use
         with open(self.token_path, 'wb') as token:

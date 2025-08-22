@@ -28,7 +28,9 @@ html{
         `}</style>
       </head>
       <body>
-        <GoogleOAuthProvider clientId="310956913290-9jdlsg2ad7in5lbjnnoc5eeuohuftr4i.apps.googleusercontent.com">
+        <GoogleOAuthProvider
+          clientId={process.env.NEXT_PUBLIC_GOOGLE_CLIENT_ID}
+        >
           <UserProvider>{children}</UserProvider>
         </GoogleOAuthProvider>
       </body>

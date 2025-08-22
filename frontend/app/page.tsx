@@ -1,5 +1,5 @@
 "use client";
-import React, { useState, useRef, useCallback, useEffect, use } from "react";
+import React, { useState, useRef, useCallback, useEffect } from "react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import {
@@ -30,7 +30,7 @@ import { useRouter } from "next/navigation";
 import { toast } from "sonner";
 import GoogleLoginButton from "@/components/ui/google_login_button";
 
-// Enhanced interfaces from attached file
+// --- Interfaces (Unchanged) ---
 interface AudioMessage {
   type: string;
   message?: string;
@@ -90,10 +90,47 @@ interface ConnectionStats {
   sessionDuration: number;
 }
 
+// --- NEW: Audio Worklet Code ---
+// This code runs in a separate thread to process audio efficiently.
+const audioWorkletProcessorCode = `
+  class AudioStreamerProcessor extends AudioWorkletProcessor {
+    constructor() {
+      super();
+      this.bufferSize = 2048;
+      this._buffer = new Int16Array(this.bufferSize);
+      this._pos = 0;
+    }
+
+    // Converts Float32Array to Int16Array (PCM16)
+    floatTo16BitPCM(input) {
+      const output = new Int16Array(input.length);
+      for (let i = 0; i < input.length; i++) {
+        const s = Math.max(-1, Math.min(1, input[i]));
+        output[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+      }
+      return output;
+    }
+
+    process(inputs, outputs, parameters) {
+      const input = inputs[0];
+      if (input.length > 0) {
+        const channelData = input[0];
+        if(channelData) {
+            const pcmData = this.floatTo16BitPCM(channelData);
+            // Post the raw PCM16 data back to the main thread
+            this.port.postMessage(pcmData);
+        }
+      }
+      return true;
+    }
+  }
+  registerProcessor('audio-streamer-processor', AudioStreamerProcessor);
+`;
+
 export default function EnhancedScheduleVoiceFramework() {
   const router = useRouter();
 
-  // Enhanced state management from attached file
+  // --- State Management (Mostly Unchanged) ---
   const [isConnected, setIsConnected] = useState(false);
   const [isRecording, setIsRecording] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
@@ -113,42 +150,32 @@ export default function EnhancedScheduleVoiceFramework() {
   const [sessionId, setSessionId] = useState<string>("");
   const [meetings, setMeetings] = useState<Meeting[]>([]);
   const [isLoadingMeetings, setIsLoadingMeetings] = useState(false);
-
-  // UI-specific states from new design
   const [selectedVoice, setSelectedVoice] = useState("en-IN-NeerjaNeural");
   const [selectedTimezone, setSelectedTimezone] = useState("UTC");
 
-  // Enhanced refs from attached file
+  // --- Refs ---
   const wsRef = useRef<WebSocket | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
-  const processorRef = useRef<MediaRecorder | null>(null);
-  const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null);
-  const sessionStartTimeRef = useRef<number>(0);
-  const lastPingRef = useRef<number>(0);
-  const audioChunkCountRef = useRef<number>(0);
-  const qualitySamplesRef = useRef<number[]>([]);
+  const workletNodeRef = useRef<AudioWorkletNode | null>(null); // Ref for the worklet node
+  const mediaStreamSourceRef = useRef<MediaStreamAudioSourceNode | null>(null); // Ref for the audio source
 
-  // Audio processing constants from attached file
+  // Audio processing constants
   const SAMPLE_RATE = 16000;
-  const CHANNELS = 1;
-  const RECONNECT_DELAY = 3000;
 
-  // Configuration arrays from new design
+  // --- Configuration Arrays (Unchanged) ---
   const voiceCommands: VoiceCommand[] = [
     { command: "Schedule meeting", description: "Create a new meeting" },
     { command: "Cancel meeting", description: "Cancel existing meeting" },
     { command: "List meetings", description: "Show all meetings" },
     { command: "Set reminder", description: "Add meeting reminder" },
   ];
-
   const voices = [
     { value: "en-IN-NeerjaNeural", label: "English (India) - Female" },
     { value: "en-US-JennyNeural", label: "English (US) - Female" },
     { value: "en-US-GuyNeural", label: "English (US) - Male" },
     { value: "en-GB-SoniaNeural", label: "English (UK) - Female" },
   ];
-
   const timezones = [
     { value: "America/Los_Angeles", label: "UTC-8 (PST)" },
     { value: "America/New_York", label: "UTC-5 (EST)" },
@@ -157,32 +184,35 @@ export default function EnhancedScheduleVoiceFramework() {
     { value: "Asia/Kolkata", label: "UTC+5:30 (IST)" },
   ];
 
-  // Enhanced message display from attached file
+  // --- Core Functions (partially modified) ---
   const addMessage = useCallback((message: string) => {
     const timestamp = new Date().toLocaleTimeString();
     setMessages((prev) => [...prev.slice(-19), `${timestamp}: ${message}`]);
   }, []);
 
-  // Set user's actual timezone on mount
-  useEffect(() => {
-    const userTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
-    setSelectedTimezone(userTimezone || "UTC");
+  const cleanupResources = useCallback(() => {
+    console.log("[STREAM] Cleaning up all audio and WebSocket resources.");
+    // Stop microphone tracks
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach((track) => track.stop());
+      streamRef.current = null;
+    }
+    // Disconnect and close AudioContext
+    if (audioContextRef.current && audioContextRef.current.state !== "closed") {
+      workletNodeRef.current?.port.close();
+      workletNodeRef.current?.disconnect();
+      mediaStreamSourceRef.current?.disconnect();
+      audioContextRef.current.close();
+      audioContextRef.current = null;
+    }
+    // Close WebSocket
+    if (wsRef.current) {
+      wsRef.current.close();
+      wsRef.current = null;
+    }
   }, []);
 
-  // Load meetings when timezone changes
-  useEffect(() => {
-    fetchAvailability();
-  }, [selectedTimezone]);
-
-  // Auto-connect WebSocket on mount (from attached file)
-  useEffect(() => {
-    connectWebSocket();
-    return () => {
-      cleanupResources();
-    };
-  }, []);
-
-  // Enhanced WebSocket connection from attached file
+  // --- WebSocket Logic (partially modified) ---
   const connectWebSocket = useCallback(() => {
     try {
       if (wsRef.current?.readyState === WebSocket.OPEN) {
@@ -192,14 +222,13 @@ export default function EnhancedScheduleVoiceFramework() {
 
       setConnectionStatus("Connecting...");
       console.log("🔗 Connecting to: ws://localhost:8000/ws/voice-live");
-
       wsRef.current = new WebSocket("ws://localhost:8000/ws/voice-live");
+      wsRef.current.binaryType = "arraybuffer"; // Important for sending raw audio
 
       wsRef.current.onopen = () => {
         console.log("✅ WebSocket connected successfully");
         setIsConnected(true);
         setConnectionStatus("Connected");
-        sessionStartTimeRef.current = Date.now();
         addMessage("🟢 Connected to enhanced voice assistant");
         toast.success("Connected to voice assistant");
       };
@@ -218,8 +247,9 @@ export default function EnhancedScheduleVoiceFramework() {
         console.log(`🔌 WebSocket disconnected: Code ${event.code}`);
         setIsConnected(false);
         setConnectionStatus("Disconnected");
-        setIsRecording(false);
-        setIsProcessing(false);
+        if (isRecording) {
+          stopRecording(false); // Stop recording if connection drops
+        }
         addMessage(`🔴 Disconnected (Code: ${event.code})`);
         toast.error("Voice assistant disconnected");
       };
@@ -235,44 +265,40 @@ export default function EnhancedScheduleVoiceFramework() {
       setConnectionStatus("Failed to Connect");
       toast.error("Failed to connect to voice assistant");
     }
-  }, []);
+  }, [isRecording]); // isRecording added to dependencies
 
-  // Enhanced WebSocket message handler from attached file
   const handleWebSocketMessage = async (data: AudioMessage) => {
-    console.log("📨 Received:", data.type, data.message?.substring(0, 50));
-
-    if (data.session_id && !sessionId) {
-      setSessionId(data.session_id);
-    }
+    console.log(
+      "📨 [BACKEND] Received:",
+      data.type,
+      data.message?.substring(0, 50)
+    );
+    setSessionId(data.session_id || sessionId);
 
     switch (data.type) {
       case "greeting":
         addMessage(data.message || "Enhanced assistant ready");
         if (data.audio) await playAudioFromHex(data.audio);
         break;
-
       case "transcription":
         setTranscription(data.text || "");
         addMessage(`💬 You said: "${data.text}"`);
         toast.info("Speech recognized");
         break;
-
       case "processing_started":
         setIsProcessing(true);
         addMessage("🔄 Processing your speech...");
         break;
-
       case "meeting_result":
         setIsProcessing(false);
         addMessage(data.message || "✅ Meeting processed");
         if (data.audio) await playAudioFromHex(data.audio);
         if (data.event_details) {
           displayMeetingDetails(data.event_details);
-          await fetchAvailability(); // Refresh meetings
+          await fetchAvailability();
         }
         toast.success("Meeting scheduled successfully");
         break;
-
       case "unclear_speech":
       case "insufficient_audio":
       case "processing_error":
@@ -281,86 +307,41 @@ export default function EnhancedScheduleVoiceFramework() {
         if (data.audio) await playAudioFromHex(data.audio);
         toast.warning(data.message || "Please try again");
         break;
-
       case "error":
         setIsProcessing(false);
         addMessage(`❌ Error: ${data.message}`);
         if (data.audio) await playAudioFromHex(data.audio);
         toast.error(data.message || "An error occurred");
         break;
-
       default:
         console.log("🤷 Unknown message type:", data.type);
         break;
     }
   };
 
-  // Enhanced audio playback from attached file
+  // --- Audio Playback (Unchanged) ---
   const playAudioFromHex = async (hexAudio: string): Promise<void> => {
     try {
       const audioData = new Uint8Array(
         hexAudio.match(/.{2}/g)?.map((byte) => parseInt(byte, 16)) || []
       );
-
-      if (audioData.length === 0) {
-        console.warn("⚠️ Empty audio data received");
-        return;
-      }
-
-      if (!audioContextRef.current) {
-        audioContextRef.current = new (window.AudioContext ||
-          (window as any).webkitAudioContext)();
-      }
-
-      if (audioContextRef.current.state === "suspended") {
-        await audioContextRef.current.resume();
-      }
-
-      try {
-        const audioBuffer = await audioContextRef.current.decodeAudioData(
-          audioData.buffer.slice(0)
-        );
-        const source = audioContextRef.current.createBufferSource();
-        source.buffer = audioBuffer;
-        source.connect(audioContextRef.current.destination);
-        source.start();
-      } catch (decodeError) {
-        const blob = new Blob([audioData], { type: "audio/wav" });
-        const audioUrl = URL.createObjectURL(blob);
-        const audio = new Audio(audioUrl);
-        audio.onended = () => URL.revokeObjectURL(audioUrl);
-        await audio.play();
-      }
+      if (audioData.length === 0) return;
+      const tempAudioContext = new (window.AudioContext ||
+        (window as any).webkitAudioContext)();
+      const audioBuffer = await tempAudioContext.decodeAudioData(
+        audioData.buffer
+      );
+      const source = tempAudioContext.createBufferSource();
+      source.buffer = audioBuffer;
+      source.connect(tempAudioContext.destination);
+      source.start(0);
+      source.onended = () => tempAudioContext.close();
     } catch (error) {
       console.error("🔊 Audio playback failed:", error);
     }
   };
 
-  // Enhanced microphone initialization from attached file
-  const initializeMicrophone = async (): Promise<MediaStream> => {
-    try {
-      console.log("🎤 Initializing enhanced microphone...");
-
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          sampleRate: SAMPLE_RATE,
-          channelCount: CHANNELS,
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true,
-        },
-      });
-
-      streamRef.current = stream;
-      console.log("✅ Microphone initialized successfully");
-      return stream;
-    } catch (error) {
-      console.error("❌ Microphone initialization failed:", error);
-      throw new Error(`Microphone access failed: ${error}`);
-    }
-  };
-
-  // Enhanced recording functions from attached file with volume boost
+  // --- REWRITTEN: Live Streaming Recording Logic ---
   const startRecording = async () => {
     if (!isConnected || isRecording) {
       toast.warning(
@@ -369,204 +350,144 @@ export default function EnhancedScheduleVoiceFramework() {
       return;
     }
 
+    setTranscription(""); // Clear previous transcription
+    setIsRecording(true);
+    addMessage("🎤 Starting live audio stream...");
+    console.log("[STREAM] Starting recording...");
+
     try {
-      addMessage("🎤 Starting recording...");
-      const stream = await initializeMicrophone();
-
-      const mimeType = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
-        ? "audio/webm;codecs=opus"
-        : "audio/webm";
-
-      const recorder = new MediaRecorder(stream, {
-        mimeType: mimeType,
-        audioBitsPerSecond: 128000,
+      // 1. Get User Media
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          sampleRate: SAMPLE_RATE,
+          channelCount: 1,
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
       });
+      streamRef.current = stream;
 
-      processorRef.current = recorder;
-      const audioChunks: Blob[] = [];
+      // 2. Create Audio Context and Worklet
+      audioContextRef.current = new AudioContext({ sampleRate: SAMPLE_RATE });
+      const processorBlob = new Blob([audioWorkletProcessorCode], {
+        type: "application/javascript",
+      });
+      const processorUrl = URL.createObjectURL(processorBlob);
+      await audioContextRef.current.audioWorklet.addModule(processorUrl);
 
-      recorder.ondataavailable = (event) => {
-        if (event.data.size > 0) {
-          audioChunks.push(event.data);
+      workletNodeRef.current = new AudioWorkletNode(
+        audioContextRef.current,
+        "audio-streamer-processor"
+      );
+      console.log("[STREAM] AudioWorklet node created.");
+
+      // 3. Set up the message listener to stream data to WebSocket
+      workletNodeRef.current.port.onmessage = (event) => {
+        if (wsRef.current?.readyState === WebSocket.OPEN) {
+          const audioData = event.data;
+          wsRef.current.send(audioData.buffer);
         }
       };
 
-      recorder.onstop = async () => {
-        console.log("⏹️ Processing complete recording...");
+      // 4. Connect the audio graph: Mic -> Worklet
+      mediaStreamSourceRef.current =
+        audioContextRef.current.createMediaStreamSource(stream);
+      mediaStreamSourceRef.current.connect(workletNodeRef.current);
+      console.log("[STREAM] Audio graph connected.");
 
-        if (audioChunks.length > 0) {
-          try {
-            if (wsRef.current?.readyState === WebSocket.OPEN) {
-              wsRef.current.send(
-                JSON.stringify({
-                  event: "start_processing",
-                  timezone: selectedTimezone,
-                })
-              );
-            }
-
-            const audioBlob = new Blob(audioChunks, { type: mimeType });
-
-            if (!audioContextRef.current) {
-              audioContextRef.current = new (window.AudioContext ||
-                (window as any).webkitAudioContext)({ sampleRate: 16000 });
-            }
-
-            if (audioContextRef.current.state === "suspended") {
-              await audioContextRef.current.resume();
-            }
-
-            const arrayBuffer = await audioBlob.arrayBuffer();
-            const audioBuffer = await audioContextRef.current.decodeAudioData(
-              arrayBuffer
-            );
-            const channelData = audioBuffer.getChannelData(0);
-
-            // Apply volume boost for quiet audio
-            let finalChannelData = channelData;
-            if (audioBuffer.sampleRate !== 16000) {
-              finalChannelData = resampleTo16kHz(
-                channelData,
-                audioBuffer.sampleRate
-              );
-            }
-
-            const pcmData = convertToCleanPCM16(finalChannelData);
-
-            if (wsRef.current?.readyState === WebSocket.OPEN) {
-              wsRef.current.send(pcmData);
-              addMessage(
-                `📡 Sent clean audio: ${(pcmData.byteLength / 1024).toFixed(
-                  1
-                )} KB`
-              );
-            }
-
-            if (wsRef.current?.readyState === WebSocket.OPEN) {
-              wsRef.current.send(JSON.stringify({ event: "end_processing" }));
-            }
-          } catch (error) {
-            console.error("❌ Audio conversion error:", error);
-            addMessage("❌ Failed to convert audio");
-            toast.error("Failed to process audio");
-          }
-        }
-
-        audioChunks.length = 0;
-      };
-
-      recorder.start();
-      setIsRecording(true);
-      addMessage("🔴 Recording started! Speak clearly...");
-      toast.info("Recording started - speak your command");
-    } catch (error) {
-      console.error("❌ Recording start failed:", error);
-      addMessage(`❌ Recording failed: ${error}`);
-      toast.error("Recording failed");
-    }
-  };
-
-  const stopRecording = async () => {
-    if (!isRecording) return;
-
-    try {
-      console.log("⏹️ Stopping recording...");
-      setIsRecording((prevState) => {
-        console.log("Previous state:", prevState);
-        return false;
-      });
-      if (processorRef.current && processorRef.current.state === "recording") {
-        processorRef.current.stop();
+      // 5. Send control message to backend
+      if (wsRef.current?.readyState === WebSocket.OPEN) {
+        wsRef.current.send(
+          JSON.stringify({
+            event: "start_recording",
+            timezone: selectedTimezone,
+          })
+        );
+        console.log(
+          `[STREAM] Sent 'start_recording' message with timezone: ${selectedTimezone}`
+        );
       }
 
-      addMessage("⏹️ Recording stopped, processing...");
-      toast.info("Processing your speech...");
+      addMessage("🔴 Live stream active! Speak now...");
+      toast.info("Recording started - speak your command");
     } catch (error) {
-      console.error("❌ Stop recording error:", error);
+      console.error("❌ [STREAM] Failed to start recording:", error);
+      addMessage(`❌ Recording failed: ${error}`);
+      toast.error("Microphone access denied or failed.");
+      setIsRecording(false);
+      cleanupResources();
     }
   };
 
-  // Helper functions for audio processing
-  const convertToCleanPCM16 = (inputData: Float32Array): ArrayBuffer => {
-    const length = inputData.length;
-    const result = new Int16Array(length);
+  const stopRecording = async (sendMessage = true) => {
+    if (!isRecording) return;
 
-    const rms = Math.sqrt(
-      inputData.reduce((sum, sample) => sum + sample * sample, 0) / length
-    );
+    console.log("[STREAM] Stopping recording...");
+    setIsRecording(false);
+    addMessage("⏹️ Stopping live stream, preparing for processing...");
 
-    let volumeBoost = 1.0;
-    if (rms < 0.01) {
-      volumeBoost = 10.0;
-    } else if (rms < 0.05) {
-      volumeBoost = 3.0;
+    // 1. Send control message to backend
+    if (sendMessage && wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ event: "stop_recording" }));
+      console.log("[STREAM] Sent 'stop_recording' message.");
+      toast.info("Processing your speech...");
     }
 
-    for (let i = 0; i < length; i++) {
-      let sample = inputData[i] * volumeBoost;
-      sample = Math.max(-1.0, Math.min(1.0, sample));
-      const pcmSample = sample < 0 ? sample * 0x8000 : sample * 0x7fff;
-      result[i] = Math.floor(pcmSample);
+    // 2. Cleanup audio resources
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach((track) => track.stop());
+      streamRef.current = null;
     }
-
-    return result.buffer;
+    if (audioContextRef.current && audioContextRef.current.state !== "closed") {
+      workletNodeRef.current?.port.close();
+      mediaStreamSourceRef.current?.disconnect();
+      workletNodeRef.current?.disconnect();
+      await audioContextRef.current.close();
+      audioContextRef.current = null;
+      console.log("[STREAM] AudioContext closed and resources released.");
+    }
   };
 
-  const resampleTo16kHz = (
-    inputData: Float32Array,
-    originalSampleRate: number
-  ): Float32Array => {
-    if (originalSampleRate === 16000) return inputData;
-
-    const ratio = originalSampleRate / 16000;
-    const outputLength = Math.floor(inputData.length / ratio);
-    const output = new Float32Array(outputLength);
-
-    for (let i = 0; i < outputLength; i++) {
-      const srcIndex = Math.floor(i * ratio);
-      output[i] = inputData[srcIndex];
-    }
-
-    return output;
-  };
-
-  // Meeting management functions
+  // --- Meeting and UI Helper Functions (Unchanged) ---
   const fetchAvailability = async () => {
     setIsLoadingMeetings(true);
     try {
       const start = new Date().toISOString();
       const end = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
-
       const response = await fetch(
         `http://localhost:8000/calendar/availability-test?start=${start}&end=${end}&timezone=${selectedTimezone}`
       );
-
-      if (!response.ok) {
-        throw new Error(`HTTP error: ${response.status}`);
-      }
-
+      if (!response.ok) throw new Error(`HTTP error: ${response.status}`);
       const data = await response.json();
-
       if (data.availability) {
         setMeetings(
           data.availability.map((event: any) => ({
-            title: event.title || "Scheduled Meeting",
-            time: event.start.split("T")[1]?.slice(0, 5) || "00:00",
-            status: event.status || "scheduled",
-            date: event.start.split("T"),
-            participants: event.attendees?.length + 1 || 1,
+            title: event.summary || "Scheduled Meeting",
+            time: new Date(event.start.dateTime).toLocaleTimeString([], {
+              hour: "2-digit",
+              minute: "2-digit",
+              hour12: false,
+            }),
+            status: event.status || "confirmed",
+            date: new Date(event.start.dateTime).toLocaleDateString(),
+            participants: event.attendees?.length || 1,
             description: event.description || "",
             location: event.location || "",
             attendees: event.attendees || [],
-            organizer: event.organizer || "",
-            creator: event.creator || "",
+            organizer: event.organizer?.email || "",
+            creator: event.creator?.email || "",
             created: event.created || "",
             updated: event.updated || "",
             htmlLink: event.htmlLink || "",
             hangoutLink: event.hangoutLink || "",
             recurrence: event.recurrence || [],
             recurringEventId: event.recurringEventId || "",
-            endTime: event.end.split("T")[1]?.slice(0, 5) || "00:00",
+            endTime: new Date(event.end.dateTime).toLocaleTimeString([], {
+              hour: "2-digit",
+              minute: "2-digit",
+              hour12: false,
+            }),
           }))
         );
       }
@@ -580,33 +501,26 @@ export default function EnhancedScheduleVoiceFramework() {
 
   const displayMeetingDetails = (details: any) => {
     if (details.status === "success") {
-      addMessage(`📅 Meeting "${details.title}" scheduled successfully!`);
-      addMessage(`🕐 Time: ${details.start} - ${details.end}`);
-      if (details.attendees) {
-        addMessage(`👥 Attendees: ${details.attendees.join(", ")}`);
+      addMessage(
+        `📅 Meeting "${details.event_details.summary}" scheduled successfully!`
+      );
+      addMessage(
+        `🕐 Time: ${new Date(
+          details.event_details.start.dateTime
+        ).toLocaleString()} - ${new Date(
+          details.event_details.end.dateTime
+        ).toLocaleString()}`
+      );
+      if (details.event_details.attendees) {
+        addMessage(
+          `👥 Attendees: ${details.event_details.attendees
+            .map((a: any) => a.email)
+            .join(", ")}`
+        );
       }
     }
   };
 
-  // Cleanup function
-  const cleanupResources = () => {
-    if (streamRef.current) {
-      streamRef.current.getTracks().forEach((track) => track.stop());
-      streamRef.current = null;
-    }
-
-    if (wsRef.current) {
-      wsRef.current.close();
-      wsRef.current = null;
-    }
-
-    if (audioContextRef.current) {
-      audioContextRef.current.close();
-      audioContextRef.current = null;
-    }
-  };
-
-  // Quality indicators from attached file
   const getConnectionQuality = (): string => {
     if (!isConnected) return "disconnected";
     if (connectionStats.averageLatency > 1000) return "poor";
@@ -621,13 +535,31 @@ export default function EnhancedScheduleVoiceFramework() {
     if (audioFeedback.quality > 200) return "fair";
     return "poor";
   };
-  // Also add this to see when the component re-renders
+
+  // --- useEffect Hooks ---
   useEffect(() => {
-    console.log("isRecording changed to:", isRecording);
+    const userTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    setSelectedTimezone(userTimezone || "UTC");
+  }, []);
+
+  useEffect(() => {
+    if (isConnected) fetchAvailability();
+  }, [selectedTimezone, isConnected]);
+
+  useEffect(() => {
+    connectWebSocket();
+    return () => {
+      cleanupResources();
+    };
+  }, []); // Empty dependency array ensures this runs only once on mount
+
+  useEffect(() => {
+    console.log("[STATE] isRecording changed to:", isRecording);
   }, [isRecording]);
+
+  // --- JSX (UI) ---
   return (
     <div className="min-h-screen bg-gradient-to-br from-slate-50 via-blue-50 to-indigo-50">
-      {/* Enhanced Header with connection status */}
       <header className="border-b border-slate-200 bg-white/80 backdrop-blur-sm sticky top-0 z-50">
         <div className="container mx-auto px-6 py-4">
           <div className="flex items-center justify-between">
@@ -644,8 +576,6 @@ export default function EnhancedScheduleVoiceFramework() {
                 </p>
               </div>
             </div>
-
-            {/* Connection status indicator */}
             <div className="flex items-center gap-4">
               <div className="flex items-center gap-2">
                 <div
@@ -666,7 +596,6 @@ export default function EnhancedScheduleVoiceFramework() {
       <div className="container mx-auto px-6 py-8">
         <div className="grid lg:grid-cols-3 gap-8">
           <div className="lg:col-span-2 space-y-6">
-            {/* Enhanced Voice Assistant Card */}
             <Card className="border-0 shadow-xl bg-white/70 backdrop-blur-sm hover:shadow-2xl transition-all duration-500">
               <CardHeader className="text-center pb-6">
                 <CardTitle className="text-2xl font-semibold text-slate-800">
@@ -677,13 +606,14 @@ export default function EnhancedScheduleVoiceFramework() {
                 </p>
               </CardHeader>
               <CardContent className="space-y-8">
-                {/* Recording Button */}
                 <div className="flex justify-center">
                   <div className="relative">
                     <Button
-                      onClick={isRecording ? stopRecording : startRecording}
+                      onClick={
+                        isRecording ? () => stopRecording() : startRecording
+                      }
                       size="lg"
-                      disabled={!isConnected && !isRecording}
+                      disabled={!isConnected}
                       className={`w-24 h-24 rounded-full transition-all duration-300 ${
                         isRecording
                           ? "bg-gradient-to-r from-red-500 to-red-600 hover:from-red-600 hover:to-red-700 shadow-lg shadow-red-500/25"
@@ -696,35 +626,30 @@ export default function EnhancedScheduleVoiceFramework() {
                         <Mic className="w-8 h-8 text-white" />
                       )}
                     </Button>
-
                     {isRecording && (
                       <>
                         <div className="absolute inset-0 rounded-full border-4 border-red-400 animate-ping opacity-75"></div>
                         <div className="absolute inset-0 rounded-full border-2 border-red-300 animate-pulse"></div>
-                        <div className="absolute -inset-4 rounded-full border border-red-200 animate-ping animation-delay-300"></div>
                       </>
                     )}
-
                     {isProcessing && (
-                      <div className="absolute -inset-6 rounded-full border-2 border-yellow-400 animate-spin">
-                        <Loader2 className="w-4 h-4 text-yellow-600" />
+                      <div className="absolute -inset-4 flex items-center justify-center">
+                        <Loader2 className="w-8 h-8 text-yellow-500 animate-spin" />
                       </div>
                     )}
                   </div>
                 </div>
 
-                {/* Configuration Controls */}
-                <div className="grid md:grid-cols-3 gap-4">
+                <div className="grid md:grid-cols-2 gap-4">
                   <div className="space-y-2">
                     <label className="text-sm font-medium text-slate-700 flex items-center gap-2">
-                      <Volume2 className="w-4 h-4" />
-                      Voice Selection
+                      <Volume2 className="w-4 h-4" /> Voice Selection
                     </label>
                     <Select
                       value={selectedVoice}
                       onValueChange={setSelectedVoice}
                     >
-                      <SelectTrigger className="border-slate-200 hover:border-slate-300 transition-colors">
+                      <SelectTrigger>
                         <SelectValue />
                       </SelectTrigger>
                       <SelectContent>
@@ -736,17 +661,15 @@ export default function EnhancedScheduleVoiceFramework() {
                       </SelectContent>
                     </Select>
                   </div>
-
                   <div className="space-y-2">
                     <label className="text-sm font-medium text-slate-700 flex items-center gap-2">
-                      <Globe className="w-4 h-4" />
-                      Timezone
+                      <Globe className="w-4 h-4" /> Timezone
                     </label>
                     <Select
                       value={selectedTimezone}
                       onValueChange={setSelectedTimezone}
                     >
-                      <SelectTrigger className="border-slate-200 hover:border-slate-300 transition-colors">
+                      <SelectTrigger>
                         <SelectValue />
                       </SelectTrigger>
                       <SelectContent>
@@ -761,44 +684,25 @@ export default function EnhancedScheduleVoiceFramework() {
                       </SelectContent>
                     </Select>
                   </div>
-
-                  <div className="space-y-2">
-                    <label className="text-sm font-medium text-slate-700 flex items-center gap-2">
-                      <Settings className="w-4 h-4" />
-                      Connection Quality
-                    </label>
-                    <div
-                      className={`px-3 py-2 rounded-md text-sm font-medium transition-all duration-300 ${
-                        isConnected
-                          ? "bg-green-50 text-green-700 border border-green-200"
-                          : "bg-red-50 text-red-600 border border-red-200"
-                      }`}
-                    >
-                      {getConnectionQuality()}
-                    </div>
-                  </div>
                 </div>
 
-                {/* Live Transcription */}
                 <div className="space-y-3">
                   <label className="text-sm font-medium text-slate-700">
                     Live Transcription
                   </label>
                   <div className="min-h-[100px] p-4 bg-slate-50 rounded-lg border border-slate-200">
                     {transcription ? (
-                      <p className="text-slate-800 animate-fade-in">
-                        {transcription}
-                      </p>
+                      <p className="text-slate-800">{transcription}</p>
                     ) : (
                       <p className="text-slate-400 italic">
-                        Transcription will appear here when you start
-                        speaking...
+                        {isRecording
+                          ? "Listening..."
+                          : "Press the mic and speak to see transcription..."}
                       </p>
                     )}
                   </div>
                 </div>
 
-                {/* Activity Messages */}
                 <div className="space-y-3">
                   <label className="text-sm font-medium text-slate-700">
                     Activity Log
@@ -810,8 +714,11 @@ export default function EnhancedScheduleVoiceFramework() {
                           Activity messages will appear here...
                         </p>
                       ) : (
-                        messages.slice(-5).map((msg, idx) => (
-                          <div key={idx} className="text-sm text-slate-600">
+                        messages.map((msg, idx) => (
+                          <div
+                            key={idx}
+                            className="text-sm text-slate-600 font-mono"
+                          >
                             {msg}
                           </div>
                         ))
@@ -822,12 +729,10 @@ export default function EnhancedScheduleVoiceFramework() {
               </CardContent>
             </Card>
 
-            {/* Voice Commands Card */}
-            <Card className="border-0 shadow-lg bg-white/70 backdrop-blur-sm hover:shadow-xl transition-all duration-300">
+            <Card className="border-0 shadow-lg bg-white/70 backdrop-blur-sm">
               <CardHeader>
                 <CardTitle className="text-lg font-semibold text-slate-800 flex items-center gap-2">
-                  <Mic className="w-5 h-5" />
-                  Voice Commands
+                  <Mic className="w-5 h-5" /> Voice Commands
                 </CardTitle>
               </CardHeader>
               <CardContent>
@@ -835,7 +740,7 @@ export default function EnhancedScheduleVoiceFramework() {
                   {voiceCommands.map((cmd, index) => (
                     <div
                       key={index}
-                      className="p-3 bg-slate-50 rounded-lg border border-slate-200 hover:bg-slate-100 transition-colors"
+                      className="p-3 bg-slate-50 rounded-lg border border-slate-200"
                     >
                       <p className="font-medium text-slate-800">
                         "{cmd.command}"
@@ -850,14 +755,11 @@ export default function EnhancedScheduleVoiceFramework() {
             </Card>
           </div>
 
-          {/* Right Sidebar */}
           <div className="space-y-6">
-            {/* Meetings Card */}
-            <Card className="border-0 shadow-lg bg-white/70 backdrop-blur-sm hover:shadow-xl transition-all duration-300">
+            <Card className="border-0 shadow-lg bg-white/70 backdrop-blur-sm">
               <CardHeader>
                 <CardTitle className="text-lg font-semibold text-slate-800 flex items-center gap-2">
-                  <Calendar className="w-5 h-5" />
-                  Upcoming Meetings
+                  <Calendar className="w-5 h-5" /> Upcoming Meetings
                   {isLoadingMeetings && (
                     <Loader2 className="w-4 h-4 animate-spin ml-2" />
                   )}
@@ -869,25 +771,17 @@ export default function EnhancedScheduleVoiceFramework() {
                     {meetings.length === 0 ? (
                       <div className="text-center text-slate-500 py-8">
                         <Calendar className="w-12 h-12 mx-auto mb-4 text-slate-300" />
-                        <p>No meetings found</p>
-                        <p className="text-sm">
-                          Try scheduling one with voice commands
-                        </p>
+                        <p>No upcoming meetings found</p>
                       </div>
                     ) : (
                       meetings.map((meeting, index) => (
                         <div
-                          key={`${meeting.date}-${meeting.time}-${index}`}
-                          className="p-4 rounded-lg border border-slate-200 hover:border-slate-300 transition-all duration-200 hover:shadow-md bg-white/50"
+                          key={index}
+                          className="p-4 rounded-lg border border-slate-200 bg-white/50"
                         >
                           <div className="flex items-start justify-between mb-2">
                             <h4 className="font-medium text-slate-800">
                               {meeting.title}
-                              {meeting.date && (
-                                <span className="text-sm text-slate-500 ml-2">
-                                  ({meeting.date})
-                                </span>
-                              )}
                             </h4>
                             <Badge
                               variant={
@@ -895,17 +789,7 @@ export default function EnhancedScheduleVoiceFramework() {
                                   ? "default"
                                   : "destructive"
                               }
-                              className={`${
-                                meeting.status === "confirmed"
-                                  ? "bg-green-100 text-green-800 hover:bg-green-200"
-                                  : "bg-red-100 text-red-800 hover:bg-red-200"
-                              } transition-colors`}
                             >
-                              {meeting.status === "confirmed" ? (
-                                <CheckCircle className="w-3 h-3 mr-1" />
-                              ) : (
-                                <XCircle className="w-3 h-3 mr-1" />
-                              )}
                               {meeting.status}
                             </Badge>
                           </div>
@@ -919,54 +803,11 @@ export default function EnhancedScheduleVoiceFramework() {
                               {meeting.participants}
                             </div>
                           </div>
-                          {meeting.location && (
-                            <div className="text-sm text-slate-600 mt-1">
-                              📍 {meeting.location}
-                            </div>
-                          )}
-                          {meeting.description && (
-                            <div className="text-sm text-slate-600 mt-1">
-                              {meeting.description}
-                            </div>
-                          )}
                         </div>
                       ))
                     )}
                   </div>
                 </ScrollArea>
-              </CardContent>
-            </Card>
-
-            {/* Quick Stats Card */}
-            <Card className="border-0 shadow-lg bg-white/70 backdrop-blur-sm hover:shadow-xl transition-all duration-300">
-              <CardHeader>
-                <CardTitle className="text-lg font-semibold text-slate-800">
-                  Quick Stats
-                </CardTitle>
-              </CardHeader>
-              <CardContent>
-                <div className="space-y-4">
-                  <div className="flex justify-between items-center">
-                    <span className="text-slate-600">Scheduled Today</span>
-                    <span className="font-semibold text-green-600">
-                      {meetings.filter((m) => m.status === "scheduled").length}
-                    </span>
-                  </div>
-                  <Separator />
-                  <div className="flex justify-between items-center">
-                    <span className="text-slate-600">Audio Quality</span>
-                    <span className="font-semibold text-blue-600">
-                      {getAudioQuality()}
-                    </span>
-                  </div>
-                  <Separator />
-                  <div className="flex justify-between items-center">
-                    <span className="text-slate-600">Session Duration</span>
-                    <span className="font-semibold text-indigo-600">
-                      {Math.round(connectionStats.sessionDuration)}s
-                    </span>
-                  </div>
-                </div>
               </CardContent>
             </Card>
           </div>

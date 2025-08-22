@@ -1,4 +1,5 @@
 
+from contextlib import asynccontextmanager
 import tempfile
 import azure.cognitiveservices.speech as speechsdk
 import traceback
@@ -29,13 +30,98 @@ from core.conversation_flow import fill_missing_fields, handle_scheduling
 from core.timezone_utils import parse_datetime, validate_timezone
 from config.config import Config
 
-# Setup logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')  # Missing closing parenthesis
+
+
+
+# --- 1. Structured Logging Setup ---
+log_format = '%(asctime)s - %(levelname)s - [Session:%(session_id)s] - %(message)s'
+logging.basicConfig(level=logging.INFO, format=log_format)
 logger = logging.getLogger(__name__)
 
-app = FastAPI()
+# Adding a filter to handle cases where session_id is not present
+class SessionIdFilter(logging.Filter):
+    def filter(self, record):
+        if not hasattr(record, 'session_id'):
+            record.session_id = 'N/A'
+        return True
+logger.addFilter(SessionIdFilter())
+#---------------------------------------------------------------------------------------
+# --- 2. Connection Manager Class ---
+class ConnectionManager:
+    def __init__(self):
+        # A dictionary to hold all active sessions, keyed by a unique session ID
+        self.active_sessions: Dict[int, Dict[str, Any]] = {}
+        # A dictionary for audio processors, linked to the session
+        self.audio_processors: Dict[int, SmartAudioProcessor] = {}
+        logging.info("ConnectionManager initialized.")
 
-# CORS configuration
+    async def connect(self, websocket: WebSocket) -> int:
+        """Accepts a new WebSocket connection and initializes a session."""
+        await websocket.accept()
+        session_id = id(websocket)
+        
+        # Initialize a new SmartAudioProcessor for this session
+        self.audio_processors[session_id] = SmartAudioProcessor()
+        
+        # Create a comprehensive session dictionary
+        self.active_sessions[session_id] = {
+            'id' : session_id,
+            'websocket': websocket,
+            'audio_buffer': bytearray(),
+            'timezone': 'UTC',
+            'is_recording': False,
+            'processing_lock': asyncio.Lock(), # Crucial for preventing race conditions
+            'temp_files': [],
+            'total_audio_duration': 0,
+            'chunk_count': 0,
+            'greeting_sent': False,
+            'is_recording': False,      
+         
+        }
+        logger.info(f"New connection established.", extra={"session_id": session_id})
+        return session_id
+
+    def disconnect(self, session_id: int):
+        """Removes a session upon disconnection."""
+        if session_id in self.active_sessions:
+            del self.active_sessions[session_id]
+        if session_id in self.audio_processors:
+            del self.audio_processors[session_id]
+        logger.info(f"Connection closed and resources cleaned up.", extra={"session_id": session_id})
+
+    def get_session(self, session_id: int) -> Optional[Dict[str, Any]]:
+        """Retrieves a session by its ID."""
+        return self.active_sessions.get(session_id)
+
+    def get_processor(self, session_id: int) -> Optional[SmartAudioProcessor]:
+        """Retrieves an audio processor by session ID."""
+        return self.audio_processors.get(session_id)
+
+# Create a single global instance of the manager
+manager = ConnectionManager()
+#---------------------------------------------------------------------------------------
+# --- 3. Application Lifespan and Service Initialization ---
+services = {}
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+
+    logger.info("Application starting up...")
+
+    services["calendar"] = CalendarService()
+    services["voice_to_text"] = VoiceToText(config.azure_speech_key, config.azure_speech_region)
+    services["text_to_voice"] = TextToVoice(config.azure_speech_key, config.azure_speech_region)
+    services["gpt_agent"] = GPTAgent(config.gpt_api_key)
+    
+    logger.info("All services have been initialized successfully.")
+    
+    yield
+    logger.info("Application shutting down...")
+    services.clear()
+
+app = FastAPI(lifespan=lifespan)
+
+# --- 4.CORS middlewere configuration--------------------------------
 origins = ["http://localhost:3000", "http://localhost:3001", "https://localhost:3000"]
 app.add_middleware(
     CORSMiddleware,
@@ -52,9 +138,7 @@ active_sessions = {}
 
 config = Config()
 
-voice_to_text = VoiceToText(config.azure_speech_key, config.azure_speech_region)
-text_to_voice = TextToVoice(config.azure_speech_key, config.azure_speech_region)
-gpt_agent = GPTAgent(config.gpt_api_key)
+
 # Add these lines after line 39 (after gpt_agent = GPTAgent...)
 audio_processors: Dict[int, SmartAudioProcessor] = {}
 processing_status: Dict[int, bool] = {}
@@ -212,92 +296,74 @@ async def handle_control_message_new(websocket: WebSocket, message: dict, sessio
         logger.error(traceback.format_exc())
 
 
+
+
 @app.websocket("/ws/voice-live")
 async def websocket_endpoint(websocket: WebSocket):
-    await websocket.accept()
-    session_id = id(websocket)
-    
-    # Initialize processor for this session
-    audio_processors[session_id] = SmartAudioProcessor()
-    processing_status[session_id] = False
-    
-    # Initialize session
-    session = {
-        'id': str(session_id),
-        'audio_buffer': bytearray(),
-        'timezone': 'UTC',
-        'is_recording': False,
-        'silence_timer': None,
-        'processing': False,
-        'temp_files': [],
-        'last_activity': time.time(),
-        'total_audio_duration': 0,
-        'chunk_count': 0,
-        'audio_quality_samples': [],
-        'greeting_sent': False  # ADD THIS FLAG
-    }
-    
-    active_sessions[session_id] = session
-    
+    # 1. Connect and get a unique session ID
+    session_id = await manager.connect(websocket)
+    session = manager.get_session(session_id)
+    processor = manager.get_processor(session_id)
+
+    if not session or not processor:
+        logger.error(f"Failed to initialize session or processor.", extra={"session_id": session_id})
+        return
+
     try:
-        # Send greeting
+        # 2. Send the initial greeting
         if not session['greeting_sent']:
-            greeting_msg = "Voice Assistant ready! High-quality real-time processing enabled."
+            greeting_msg = "Voice Assistant ready. High-quality real-time processing enabled."
             await send_audio_response(websocket, greeting_msg, "greeting", session)
             session['greeting_sent'] = True
         
+        # 3. Start the main message-handling loop
         while True:
-            try:
-                message = await websocket.receive()
-                # Add this debug logging in your WebSocket loop before processing:
-                # logger.info(f"🔍 DEBUG - Message received: {message}")
-                # logger.info(f"🔍 DEBUG - Message type: {type(message)}")
-                # if "text" in message:
-                #      logger.info(f"🔍 DEBUG - Text content: {message['text']}")
-                #      logger.info(f"🔍 DEBUG - Text type: {type(message['text'])}")
+            message = await websocket.receive()
 
-                # FIXED: Better message type checking
-                if message.get("type") == "websocket.receive":
-                    if "text" in message:
-                        # Handle control messages
-                        try:
-                            text_data = message["text"]
-                            if isinstance(text_data, str):  # Ensure it's a string
-                                data = json.loads(text_data)
-                                logger.info(f"📨 Control event [{session_id}]: {data.get('event')}")
-                                await handle_control_message_new(websocket, data, session, session_id)
-                            else:
-                                logger.error(f"❌ Invalid text data type: {type(text_data)}")
-                        except json.JSONDecodeError as e:
-                            logger.error(f"❌ Invalid JSON received: {e}")
-                        except Exception as e:
-                            logger.error(f"❌ Error processing text message: {e}")
-                            
-                    elif "bytes" in message:
-                        # Handle audio data with SMART processing
-                        await handle_audio_data_smart(websocket, session_id, message["bytes"])
+            if message.get("type") == "websocket.receive":
+                # Handle TEXT messages (JSON control commands)
+                if "text" in message:
+                    try:
+                        data = json.loads(message["text"])
+                        event = data.get("event")
+                        logger.info(f"Control event received: '{event}'", extra={"session_id": session_id})
                         
-            except Exception as e:
-                   # Check if it's a disconnect error
-                if "disconnect" in str(e).lower() or "receive" in str(e).lower():
-                    logger.info(f"🔌 WebSocket {session_id} disconnected: {e}")
-                    break
-                else:
-                    logger.error(f"❌ Error in WebSocket loop: {e}")
-                
+                        if event == "start_recording":
+                            logger.info("Event: 'start_recording'. Resetting processor and enabling recording.", extra={"session_id": session_id})
+                            processor.reset()
+                          
+                            session['is_recording'] = True
+                            session['timezone'] = data.get('timezone', 'UTC')
+                        
+                        elif event == "stop_recording":
+                            logger.info("Event: 'stop_recording'. Disabling recording and processing final audio.", extra={"session_id": session_id})
+                            session['is_recording'] = False
+                            # Process any remaining audio in the buffer
+                            if len(processor.get_complete_audio()) > 0:
+                                await process_complete_audio(websocket, session)
+
+                    except json.JSONDecodeError:
+                        logger.warning("Received invalid JSON.", extra={"session_id": session_id})
+                    except Exception as e:
+                        logger.error(f"Error handling control message: {e}", extra={"session_id": session_id})
+
+                # Handle BINARY messages (raw audio chunks)
+                elif "bytes" in message:
+                    audio_chunk = message["bytes"]
+                    if session['is_recording']:
+                        # The processor decides if enough audio has been received (e.g., after silence)
+                        if processor.add_audio_chunk(audio_chunk):
+                            await process_complete_audio(websocket, session)
+
     except WebSocketDisconnect:
-        logger.info(f"🔌 WebSocket {session_id} disconnected")
+        logger.info(f"Client disconnected.", extra={"session_id": session_id})
+    except Exception as e:
+        logger.error(f"An unexpected error occurred in the WebSocket endpoint: {e}", extra={"session_id": session_id})
+        logger.error(traceback.format_exc(), extra={"session_id": session_id})
     finally:
-        # Cleanup
-        audio_processors.pop(session_id, None)
-        processing_status.pop(session_id, None)
-        active_sessions.pop(session_id, None)
-        if session_id in audio_processors:
-            audio_processors.pop(session_id, None)
-        if session_id in processing_status:
-            processing_status.pop(session_id, None)
-        if session_id in active_sessions:
-            active_sessions.pop(session_id, None)
+        # 4. ALWAYS disconnect and clean up resources
+        manager.disconnect(session_id)
+
 
 async def handle_control_message(websocket: WebSocket, message: dict, session: dict):
     """Enhanced control message handler with better error handling"""
@@ -470,6 +536,7 @@ async def send_audio_response(websocket: WebSocket, text: str, response_type: st
         
         # Enhanced audio synthesis
         try:
+            text_to_voice=services["text_to_voice"]
             audio_response = text_to_voice.synthesize(text)
             logger.info(f"🔊 Synthesized audio for response [{session['id']}]: {len(audio_response)} bytes")
             if audio_response and len(audio_response) > 0:
@@ -532,159 +599,77 @@ async def save_pcm_as_wav(audio_buffer: bytearray) -> Optional[str]:
         logger.error(f"💥 Error saving PCM as WAV: {e}")
         return None
 
+# main.py
+
+# Find your existing process_complete_audio function and modify it
 async def process_complete_audio(websocket: WebSocket, session: dict):
-    """Enhanced audio processing with better error handling and optimization"""
-    session_id = session['id']
-        
-    # Log buffer state
-    buffer_size = len(session['audio_buffer'])
-    logger.info(f"🔄 Starting audio processing for {session_id}:")
-    logger.info(f"   📊 Buffer size: {buffer_size} bytes")
-    logger.info(f"   📊 Chunk count: {session['chunk_count']}")
-    logger.info(f"   📊 Duration: {session['total_audio_duration']:.2f}s")
-    logger.info(f"   📊 Recording: {session['is_recording']}")
-    logger.info(f"   📊 Processing: {session['processing']}")
+    session_id = id(session['websocket'])
     
-    if buffer_size == 0:
-        logger.error(f"❌ Audio buffer is EMPTY for session {session_id}!")
-        await send_audio_response(websocket, 
-            "No audio data received. Please try recording again.", 
-            "no_audio", session)
-        return
-        
-    # Prevent duplicate processing
-    # if session_id in processing_lock or session['processing']:
-    #     logger.warning(f"⚠️ Already processing session {session_id}, skipping")
-    #     return
-        
-    # processing_lock[session_id] = True
-    session['processing'] = True
-    temp_file = None
-    # Prevent duplicate processing
-    # if session_id in processing_lock or session['processing']:
-    #     logger.warning(f"⚠️ Already processing session {session_id}, skipping")
-    #     return
-        
-    # # processing_lock[session_id] = True
-    # session['processing'] = True
-    # temp_file = None
-    
-    try:
-        await websocket.send_json({
-            "type": "processing_started",
-            "message": "🔄 Processing your speech...",
-            "audio_duration": round(session['total_audio_duration'], 2),
-            "audio_size": len(session['audio_buffer']),
-            "session_id": session_id
-        })
-        logger.info(f"🔄 Processing audio for session {session_id} ({len(session['audio_buffer'])} bytes)"  )
-        # Validate audio buffer
-        # if len(session['audio_buffer']) < SAMPLE_RATE:  # Less than 1 second
-        #     await send_audio_response(websocket, 
-        #         "I didn't receive enough audio. Please speak for at least 1 second.", 
-        #         "insufficient_audio", session)
-        #     return
-        
-        # Quality check
-        # overall_quality = validate_audio_buffer_quality(session['audio_buffer'])
-        # if not overall_quality['is_valid']:
-        #     await send_audio_response(websocket, 
-        #         f"Audio quality issue: {overall_quality['reason']}. Please try again.", 
-        #         "poor_quality", session)
-        #     return
-        
-        # Save audio as WAV file
-        temp_file = await save_pcm_as_wav(session['audio_buffer'])
-        if not temp_file:
-            raise Exception("Failed to save audio file")
-            
-        session['temp_files'].append(temp_file)
-        
-        # Enhanced Speech-to-Text
-        user_input = await enhanced_speech_to_text(temp_file, session)
-        
-        # if not user_input or len(user_input.strip()) < 2:
-        #     await send_audio_response(websocket, 
-        #         "I couldn't understand what you said. Please speak more clearly and try again.", 
-        #         "unclear_speech", session)
-        #     return
-        if user_input and len(user_input.strip()) > 0:
-            await websocket.send_json({
-            "type": "transcription",
-            "text": user_input,
-            "confidence": "high",  # You could get this from Azure STT
-            "session_id": session_id
-        })
-        else:
-        # Send error if no transcription
-            await websocket.send_json({
-            "type": "transcription",
-            "text": "No speech recognized",
-            "confidence": "low", 
-            "session_id": session_id
-        })
-            await send_audio_response(websocket, 
-            "I couldn't understand what you said. Please try again.", 
-            "unclear_speech", session)
-        
-        # Check for exit commands
-        if any(cmd in user_input.lower() for cmd in EXIT_COMMANDS):
-            await send_audio_response(websocket, 
-                "Goodbye! Thanks for using the voice assistant.", 
-                "goodbye", session)
+    # Use the session-specific lock to ensure only one processing task runs at a time
+    async with session['processing_lock']:
+        processor = manager.get_processor(session_id)
+        if not processor: return
+
+        # Get the full audio utterance from the smart processor
+        complete_audio = processor.get_complete_audio()
+        audio_duration = len(complete_audio) / (SAMPLE_RATE * BYTES_PER_SAMPLE)
+
+        logger.info(f"Processing complete audio segment of {audio_duration:.2f}s", extra={"session_id": session_id})
+
+        if len(complete_audio) < SAMPLE_RATE: # Less than 0.5s of audio
+            logger.warning("Insufficient audio to process.", extra={"session_id": session_id})
+            await send_audio_response(websocket, "I didn't hear enough audio, please try speaking for a bit longer.", "insufficient_audio", session)
             return
-        
-        # Enhanced GPT Processing
+
+        temp_file = None
         try:
+            await websocket.send_json({
+                "type": "processing_started",
+                "message": "🔄 Processing your speech...",
+                "session_id": session_id
+            })
+            
+            temp_file = await save_pcm_as_wav(bytearray(complete_audio))
+            if not temp_file:
+                raise Exception("Failed to save audio to temporary WAV file.")
+
+            user_input = await enhanced_speech_to_text(temp_file, session)
+            
+            # ... (the rest of your logic from the original function)
+            # ... (STT -> GPT -> Calendar -> TTS)
+            
+            if not user_input:
+                await send_audio_response(websocket, "I couldn't quite understand that. Could you say it again?", "unclear_speech", session)
+                return
+            
+            await websocket.send_json({"type": "transcription", "text": user_input, "session_id": session_id})
+            
+            # (Your logic for GPT, scheduling, etc. goes here)
             intent, entities = await process_with_gpt(user_input, session)
+            if intent == "schedule_meeting":
+                entities['timezone'] = session['timezone']
+                await process_meeting_scheduling(websocket, entities, session)
+            else:
+                # Handle other intents or general conversation
+                reply = entities.get("reply", "I can only help with scheduling meetings right now.")
+                await send_audio_response(websocket, reply, "clarification", session)
+
         except Exception as e:
-            logger.error(f"💥 GPT processing error for {session_id}: {e}")
-            await send_audio_response(websocket, 
-                "I had trouble understanding your request. Please try rephrasing it.", 
-                "processing_error", session)
-            return
-        
-        if intent != "schedule_meeting":
-            response_text = entities.get("reply", 
-                "I can help you schedule meetings. Please tell me about the meeting you'd like to schedule - "
-                "include details like who you're meeting with, when, and for how long.")
-            await send_audio_response(websocket, response_text, "clarification", session)
-            return
-        
-        # Enhanced Meeting Scheduling
-        entities['timezone'] = session['timezone']
-        await process_meeting_scheduling(websocket, entities, session)
-        
-    except Exception as e:
-        logger.error(f"💥 Processing error for {session_id}: {str(e)}")
-        await send_audio_response(websocket, 
-            "I encountered an error processing your request. Please try again.", 
-            "error", session)
-    finally:
-        # Cleanup
-        session['processing'] = False
-        session['audio_buffer'].clear()
-        session['chunk_count'] = 0
-        session['total_audio_duration'] = 0
-        
-        if session['silence_timer']:
-            session['silence_timer'].cancel()
-            session['silence_timer'] = None
-        
-        if temp_file:
-            # cleanup_temp_file(temp_file)
-            pass
-        
-        if session_id in processing_lock:
-            del processing_lock[session_id]
+            logger.error(f"Error during audio processing pipeline: {e}", extra={"session_id": session_id})
+            await send_audio_response(websocket, "I ran into a problem processing that. Please try again.", "error", session)
+        finally:
+            if temp_file and os.path.exists(temp_file):
+                cleanup_temp_file(temp_file)
+            logger.info("Finished processing audio segment.", extra={"session_id": session_id})
 # ADD THIS FUNCTION:
 async def process_meeting_scheduling(websocket: WebSocket, entities: dict, session: dict):
     """Process meeting scheduling with enhanced error handling"""
     try:
         logger.info(f"Processing meeting scheduling for session {session['id']}")
-        
+        text_to_voice=services["text_to_voice"]
         # Enhanced field completion
         completed_entities = await fill_missing_fields_async(entities, text_to_voice, websocket, session)
+        calendar_service = services.get("calendar")
         
         # Schedule the meeting
         result = calendar_service.intelligent_schedule_handler(completed_entities)
@@ -863,7 +848,7 @@ async def process_with_gpt(user_input: str, session: dict) -> tuple:
             'session_duration': time.time() - session.get('start_time', time.time()),
             'previous_interactions': getattr(session, 'interaction_history', [])
         }
-        
+        gpt_agent=services["gpt_agent"]
         # Process with context
         intent, entities = gpt_agent.process_input(user_input)
         
@@ -982,9 +967,10 @@ async def process_audio_chunks(websocket, audio_chunks, timezone, voice_to_text,
 @app.get("/calendar/availability")
 async def get_availability1(start: str, end: str, timezone: str,entities: dict, websocket: WebSocket, session: dict):
     try:
+        text_to_voice=services["text_to_voice"]
         # Enhanced field completion
         completed_entities = await fill_missing_fields_async(entities, text_to_voice, websocket, session)
-        
+        calendar_service = services.get("calendar")
         # Schedule the meeting
         result = calendar_service.intelligent_schedule_handler(completed_entities)
         
@@ -1014,45 +1000,27 @@ async def get_availability1(start: str, end: str, timezone: str,entities: dict, 
     
 @app.get("/calendar/availability-test")
 async def test_availability(start: str, end: str, timezone: str):
-    global calendar_service
-    calendar_service = CalendarService()
-    if 'calendar_service' not in globals() or calendar_service is None:
-        logger.error("❌ inside availability test _______________calendar_service is not initialized")
-        raise HTTPException(status_code=500, detail="Calendar service not initialized")
+    logger.info(f"GET /calendar/availability-test called with timezone: {timezone}")
+    calendar_service = services.get("calendar")
     
-    logger.info(f"🔍 GET /calendar/availability called")
-    logger.info(f"📅 Parameters: start={start}, end={end}, timezone={timezone}")
+    if not calendar_service:
+        logger.error("FATAL: Calendar service is not available.")
+        raise HTTPException(status_code=500, detail="Internal server error: Calendar service not loaded")
     
     try:
-        # Check if calendar_service exists
-        if not hasattr(globals(), 'calendar_service') or calendar_service is None:
-            logger.error("❌ calendar_service is not initialized")
-            raise HTTPException(status_code=500, detail="Calendar service not initialized")
-        
-        logger.info("📞 Calling calendar_service.get_availability...")
         availability = calendar_service.get_availability(start, end, timezone)
-        
-        logger.info(f"✅ Successfully got {len(availability)} events")
-        logger.info(f"🔍 First event (if any): {availability[0] if availability else 'None'}")
-        
+        logger.info(f"Successfully retrieved {len(availability)} events.")
         return {"availability": availability}
-        
-    except ValueError as ve:
-        logger.error(f"❌ ValueError in get_availability: {str(ve)}")
-        logger.error(f"🔍 Full traceback: {traceback.format_exc()}")
-        raise HTTPException(status_code=400, detail=f"Invalid input: {str(ve)}")
-        
     except Exception as e:
-        logger.error(f"❌ Unexpected error in get_availability: {str(e)}")
-        logger.error(f"🔍 Full traceback: {traceback.format_exc()}")
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+        logger.error(f"Error fetching availability: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {e}")
 
 # Also add this to test calendar_service initialization
 @app.get("/calendar/test")
 async def test_calendar_service():
     try:
         logger.info("🧪 Testing calendar service...")
-        
+        calendar_service = services.get("calendar")
         if not hasattr(globals(), 'calendar_service'):
             return {"status": "error", "message": "calendar_service not in globals"}
         
@@ -1098,6 +1066,7 @@ async def get_events(start: str, end: str, timezone: str,entities , websocket: W
 
     try:
         loop = asyncio.get_event_loop()
+        text_to_voice=services["text_to_voice"]
         return await loop.run_in_executor(None, fill_missing_fields, entities, text_to_voice, websocket)
     except Exception as e:
         logger.error(f"Error in fill_missing_fields for {session['id']}: {e}")
@@ -1336,7 +1305,7 @@ if __name__ == "__main__":
     import uvicorn
     uvicorn.run(
         app, 
-        host="0.0.0.0", 
+        host="localhost", 
         port=8000,
         log_level="info",
         access_log=True
