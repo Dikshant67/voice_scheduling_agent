@@ -420,29 +420,34 @@ export default function EnhancedScheduleVoiceFramework() {
     }
   };
 
+  // In page.tsx
+
   const stopRecording = async (sendMessage = true) => {
+    // 1. First, check if we are actually recording. If not, do nothing.
     if (!isRecording) return;
 
     console.log("[STREAM] Stopping recording...");
-    setIsRecording(false);
-    addMessage("⏹️ Stopping live stream, preparing for processing...");
 
-    // 1. Send control message to backend
+    // 2. IMPORTANT: Set the recording state to false IMMEDIATELY.
+    // This makes the UI update instantly (button color changes, etc.).
+    setIsRecording(false);
+
+    // 3. Tell the backend that we are done sending audio.
     if (sendMessage && wsRef.current?.readyState === WebSocket.OPEN) {
       wsRef.current.send(JSON.stringify({ event: "stop_recording" }));
       console.log("[STREAM] Sent 'stop_recording' message.");
       toast.info("Processing your speech...");
     }
 
-    // 2. Cleanup audio resources
+    // 4. Fully clean up and release all audio resources to guarantee no more audio is sent.
     if (streamRef.current) {
       streamRef.current.getTracks().forEach((track) => track.stop());
       streamRef.current = null;
+      console.log("[STREAM] Microphone track stopped.");
     }
     if (audioContextRef.current && audioContextRef.current.state !== "closed") {
-      workletNodeRef.current?.port.close();
-      mediaStreamSourceRef.current?.disconnect();
       workletNodeRef.current?.disconnect();
+      mediaStreamSourceRef.current?.disconnect();
       await audioContextRef.current.close();
       audioContextRef.current = null;
       console.log("[STREAM] AudioContext closed and resources released.");
@@ -450,46 +455,83 @@ export default function EnhancedScheduleVoiceFramework() {
   };
 
   // --- Meeting and UI Helper Functions (Unchanged) ---
+  // In your page.tsx file
+
   const fetchAvailability = async () => {
     setIsLoadingMeetings(true);
     try {
       const start = new Date().toISOString();
       const end = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
+
       const response = await fetch(
         `http://localhost:8000/calendar/availability-test?start=${start}&end=${end}&timezone=${selectedTimezone}`
       );
-      if (!response.ok) throw new Error(`HTTP error: ${response.status}`);
+
+      if (!response.ok) {
+        throw new Error(`HTTP error: ${response.status}`);
+      }
+
       const data = await response.json();
-      if (data.availability) {
-        setMeetings(
-          data.availability.map((event: any) => ({
-            title: event.summary || "Scheduled Meeting",
-            time: new Date(event.start.dateTime).toLocaleTimeString([], {
-              hour: "2-digit",
-              minute: "2-digit",
-              hour12: false,
-            }),
+
+      // --- START OF DEBUGGING AND FIX ---
+
+      // Log 1: See the raw data (you are already seeing this)
+      console.log("1. Raw data received from backend:", data);
+
+      // FIX: Safely access the array inside the "availability" key.
+      // If data.availability doesn't exist, it defaults to an empty array.
+      const eventsArray = data.availability || [];
+
+      // Log 2: Check if we successfully got the array
+      console.log("2. Extracted events array:", eventsArray);
+
+      if (Array.isArray(eventsArray)) {
+        const mappedMeetings: Meeting[] = eventsArray.map((event: any) => {
+          // Create proper Date objects from the ISO strings
+          const startDate = new Date(event.start);
+          const endDate = new Date(event.end);
+
+          // This mapping now matches your Meeting interface exactly
+          return {
+            title: event.title || "No Title",
             status: event.status || "confirmed",
-            date: new Date(event.start.dateTime).toLocaleDateString(),
-            participants: event.attendees?.length || 1,
             description: event.description || "",
             location: event.location || "",
-            attendees: event.attendees || [],
-            organizer: event.organizer?.email || "",
-            creator: event.creator?.email || "",
+            organizer: event.organizer || "",
+            creator: event.creator || "",
             created: event.created || "",
             updated: event.updated || "",
-            htmlLink: event.htmlLink || "",
+            attendees: event.attendees || [],
             hangoutLink: event.hangoutLink || "",
+            htmlLink: event.htmlLink || "",
             recurrence: event.recurrence || [],
             recurringEventId: event.recurringEventId || "",
-            endTime: new Date(event.end.dateTime).toLocaleTimeString([], {
+            participants: (event.attendees?.length || 0) + 1, // +1 for the organizer
+
+            // Formatted date and time fields
+            date: startDate.toLocaleDateString(undefined, {
+              weekday: "long",
+              year: "numeric",
+              month: "long",
+              day: "numeric",
+            }),
+            time: startDate.toLocaleTimeString(undefined, {
               hour: "2-digit",
               minute: "2-digit",
-              hour12: false,
+              hour12: true,
             }),
-          }))
-        );
+            endTime: endDate.toLocaleTimeString(undefined, {
+              hour: "2-digit",
+              minute: "2-digit",
+              hour12: true,
+            }),
+          };
+        });
+
+        // Log 3: Check the final, mapped data before it goes to the UI
+        console.log("3. Mapped meetings ready for UI:", mappedMeetings);
+
+        setMeetings(mappedMeetings);
       }
     } catch (error) {
       console.error("Fetch error:", error);
@@ -498,7 +540,6 @@ export default function EnhancedScheduleVoiceFramework() {
       setIsLoadingMeetings(false);
     }
   };
-
   const displayMeetingDetails = (details: any) => {
     if (details.status === "success") {
       addMessage(
@@ -536,23 +577,37 @@ export default function EnhancedScheduleVoiceFramework() {
     return "poor";
   };
 
-  // --- useEffect Hooks ---
+  // Effect 1: Runs only ONCE when the component mounts
   useEffect(() => {
+    // Set the user's timezone as soon as the component loads
     const userTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
     setSelectedTimezone(userTimezone || "UTC");
-  }, []);
 
-  useEffect(() => {
-    if (isConnected) fetchAvailability();
-  }, [selectedTimezone, isConnected]);
-
-  useEffect(() => {
+    // Start the WebSocket connection process
     connectWebSocket();
+
+    // This return function is a cleanup that runs when the component is unmounted
     return () => {
       cleanupResources();
     };
-  }, []); // Empty dependency array ensures this runs only once on mount
+  }, []); // The empty array [] means this runs only once on mount
 
+  // Effect 2: Runs whenever the `isConnected` state changes
+  useEffect(() => {
+    // If we have just successfully connected, fetch the meetings.
+    if (isConnected) {
+      fetchAvailability();
+    }
+  }, [isConnected]); // This hook is dedicated to fetching data upon connection
+
+  // Effect 3: Runs whenever the user changes the timezone in the dropdown
+  useEffect(() => {
+    // If we are connected, fetch the meetings again for the new timezone.
+    // We check isConnected to avoid fetching before the app is ready.
+    if (isConnected) {
+      fetchAvailability();
+    }
+  }, [selectedTimezone]); // This hook is dedicated to re-fetching on timezone change
   useEffect(() => {
     console.log("[STATE] isRecording changed to:", isRecording);
   }, [isRecording]);
@@ -777,12 +832,18 @@ export default function EnhancedScheduleVoiceFramework() {
                       meetings.map((meeting, index) => (
                         <div
                           key={index}
-                          className="p-4 rounded-lg border border-slate-200 bg-white/50"
+                          className="p-4 rounded-lg border border-slate-200 bg-white/50 hover:shadow-md transition-shadow"
                         >
                           <div className="flex items-start justify-between mb-2">
-                            <h4 className="font-medium text-slate-800">
-                              {meeting.title}
-                            </h4>
+                            {/* Display the meeting title and date */}
+                            <div>
+                              <h4 className="font-medium text-slate-800">
+                                {meeting.title}
+                              </h4>
+                              <p className="text-sm text-slate-500">
+                                {meeting.date}
+                              </p>
+                            </div>
                             <Badge
                               variant={
                                 meeting.status === "confirmed"
@@ -793,16 +854,47 @@ export default function EnhancedScheduleVoiceFramework() {
                               {meeting.status}
                             </Badge>
                           </div>
-                          <div className="flex items-center gap-4 text-sm text-slate-600">
-                            <div className="flex items-center gap-1">
+
+                          {/* Display time and participant count */}
+                          <div className="flex items-center gap-4 text-sm text-slate-600 mb-2">
+                            <div className="flex items-center gap-1.5">
                               <Clock className="w-4 h-4" />
                               {meeting.time} - {meeting.endTime}
                             </div>
-                            <div className="flex items-center gap-1">
+                            <div className="flex items-center gap-1.5">
                               <Users className="w-4 h-4" />
-                              {meeting.participants}
+                              {meeting.participants} Participant
+                              {meeting.participants > 1 ? "s" : ""}
                             </div>
                           </div>
+
+                          {/* Conditionally display location if it exists */}
+                          {meeting.location && (
+                            <div className="flex items-center gap-1.5 text-sm text-slate-600 mb-2">
+                              📍 {meeting.location}
+                            </div>
+                          )}
+
+                          {/* Conditionally display description if it exists */}
+                          {meeting.description && (
+                            <p className="text-sm text-slate-600 mb-3 p-2 bg-slate-50 rounded">
+                              {meeting.description}
+                            </p>
+                          )}
+
+                          {/* Conditionally display a Google Meet link if it exists */}
+                          {meeting.hangoutLink && (
+                            <a
+                              href={meeting.hangoutLink}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                            >
+                              <Button variant="outline" size="sm">
+                                <Users className="w-4 h-4 mr-2" /> Join with
+                                Google Meet
+                              </Button>
+                            </a>
+                          )}
                         </div>
                       ))
                     )}

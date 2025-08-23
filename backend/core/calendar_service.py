@@ -257,88 +257,94 @@ class CalendarService:
     #         if os.path.exists(self.token_path):
     #             os.remove(self.token_path)
     #             print("🗑️ Token file deleted.")
-    def fetch_existing_events(self, start_dt, end_dt, timezone='Asia/Kolkata'):
-     """
-    Fetch existing events from Google Calendar within the specified date range,
-    returning titles and times converted to the specified timezone.
-     """
-     try:
-        # Validate inputs
-        if not isinstance(start_dt, datetime) or not isinstance(end_dt, datetime):
-            raise ValueError("start_dt and end_dt must be datetime objects")
-        validate_timezone(timezone)
-        tz = pytz.timezone(timezone)
+  # In core/calendar_service.py
 
-        # Ensure start_dt and end_dt are timezone-aware
-        if start_dt.tzinfo is None:
-            start_dt = start_dt.replace(tzinfo=pytz.UTC)
-        if end_dt.tzinfo is None:
-            end_dt = end_dt.replace(tzinfo=pytz.UTC)
+    def fetch_existing_events(self, start_dt, end_dt, timezone='UTC'):
+        """
+        Fetches raw event data from Google Calendar with all fields required by the Meeting interface.
+        """
+        try:
+            if not isinstance(start_dt, datetime) or not isinstance(end_dt, datetime):
+                raise ValueError("start_dt and end_dt must be datetime objects")
 
-        # Build Google Calendar service
-        service = build('calendar', 'v3', credentials=self.credentials)
+            service = build('calendar', 'v3', credentials=self.credentials)
+            if start_dt.tzinfo is None:
+                start_dt = start_dt.replace(tzinfo=pytz.UTC)
+            if end_dt.tzinfo is None:
+                end_dt = end_dt.replace(tzinfo=pytz.UTC)
+        # We are adding all the extra fields to this request
+            fields_to_request = (
+            "items("
+            "summary,"          # title
+            "description,"      # description
+            "location,"         # location
+            "status,"           # status
+            "start(dateTime),"  # start time
+            "end(dateTime),"    # end time
+            "organizer(email)," # organizer
+            "creator(email),"   # creator
+            "created,"          # created timestamp
+            "updated,"          # updated timestamp
+            "attendees(email,responseStatus)," # attendees
+            "hangoutLink,"      # hangoutLink
+            "htmlLink,"         # htmlLink
+            "recurrence,"       # recurrence
+            "recurringEventId"  # recurringEventId
+            ")"
+            )
         
-        # Fetch events
-        events_result = service.events().list(
+            events_result = service.events().list(
             calendarId='primary',
             timeMin=start_dt.isoformat(),
             timeMax=end_dt.isoformat(),
             singleEvents=True,
             orderBy='startTime',
             fields="items(summary,start(dateTime),end(dateTime))"
-        ).execute()
+            ).execute()
 
-        events = events_result.get('items', [])
-        formatted_events = []
+            return events_result.get('items', [])
 
-        # Process each event
-        for event in events:
-            title = event.get('summary', 'Untitled Event')
-            start_str = event.get('start', {}).get('dateTime')
-            end_str = event.get('end', {}).get('dateTime')
-
-            if start_str and end_str:
-                try:
-                    # Parse event times and convert to target timezone
-                    start_dt_event = datetime.fromisoformat(start_str).astimezone(tz)
-                    end_dt_event = datetime.fromisoformat(end_str).astimezone(tz)
-                    
-                    formatted_events.append({
-                        'title': title,
-                        'start': start_dt_event.isoformat(),  # ← Changed to ISO format
-                        'end': end_dt_event.isoformat()       # ← Changed to ISO format
-                    })
-                except ValueError as e:
-                    print(f"Skipping event '{title}' due to invalid date format: {str(e)}")
-                    continue
-
-        return formatted_events
-
-     except Exception as e:
-        raise Exception(f"Error fetching events: {str(e)}")
-     finally:
-        if os.path.exists(self.token_path):
-            print("🗑️ Token file would be deleted.")
+        except Exception as e:
+            logger.error(f"Error fetching Google Calendar events: {e}", exc_info=True)
+            return []
 
     def get_availability(self, start: str, end: str, timezone: str):
-     try:
-        validate_timezone(timezone)
-        start_dt = parse_datetime(start)
-        end_dt = parse_datetime(end)
-        events = self.fetch_existing_events(start_dt, end_dt, timezone)
-        tz = pytz.timezone(timezone)
+        """
+        Processes raw Google event data into the exact format needed by the frontend.
+        """
+        try:
+            validate_timezone(timezone)
+            start_dt = parse_datetime(start)
+            end_dt = parse_datetime(end)
         
-        # Now this will work because events have ISO format dates
-        return [{
-            'start': datetime.fromisoformat(event['start']).astimezone(tz).isoformat(),
-            'end': datetime.fromisoformat(event['end']).astimezone(tz).isoformat(),
-            'title': event['title']
-        } for event in events]
+            events = self.fetch_existing_events(start_dt, end_dt, timezone)
+            tz = pytz.timezone(timezone)
         
-     except ValueError as e:
-        raise ValueError(f"Invalid timezone or date format: {str(e)}")
-     except Exception as e:
-        raise Exception(f"Error getting availability: {str(e)}")
-     finally:
-        if os.path.exists(self.token_path):
-            print("🗑️ Token file would be deleted.")
+            processed_events = []
+            for event in events:
+                processed_event = {
+                'title': event.get('summary', 'No Title'),
+                'description': event.get('description', ''),
+                'location': event.get('location', ''),
+                'status': event.get('status', 'confirmed'),
+                'organizer': event.get('organizer', {}).get('email', ''),
+                'creator': event.get('creator', {}).get('email', ''), # Added creator
+                'created': event.get('created', ''),                 # Added created
+                'updated': event.get('updated', ''),                 # Added updated
+                'attendees': event.get('attendees', []),
+                'hangoutLink': event.get('hangoutLink', ''),
+                'htmlLink': event.get('htmlLink', ''),
+                'recurrence': event.get('recurrence', []),           # Added recurrence
+                'recurringEventId': event.get('recurringEventId', ''), # Added recurringEventId
+                'start': datetime.fromisoformat(event['start']['dateTime']).astimezone(tz).isoformat(),
+                'end': datetime.fromisoformat(event['end']['dateTime']).astimezone(tz).isoformat(),
+                    }
+                processed_events.append(processed_event)
+            
+            return processed_events
+        
+        except Exception as e:
+            logger.error(f"Error in get_availability: {e}", exc_info=True)
+        # Return empty list in case of error
+            return []
+

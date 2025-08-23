@@ -35,7 +35,7 @@ class SmartAudioProcessor:
             self.speech_detected = True
             self.silence_start_time = None
             self.last_audio_time = current_time
-            print(f"🗣️ Speech detected: RMS={rms:.4f}")
+            # print(f"🗣️ Speech detected: RMS={rms:.4f}")
             return False
         else:
             if self.silence_start_time is None:
@@ -44,7 +44,7 @@ class SmartAudioProcessor:
             silence_duration = current_time - self.silence_start_time
             total_duration = current_time - self.recording_start_time
             
-            print(f"🔇 Silence: {silence_duration:.1f}s, Total: {total_duration:.1f}s")
+            # print(f"🔇 Silence: {silence_duration:.1f}s, Total: {total_duration:.1f}s")
             
             should_process = (
                 (self.speech_detected and silence_duration >= self.min_silence_duration) or
