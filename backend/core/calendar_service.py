@@ -2,7 +2,7 @@ import logging
 import os
 import pickle
 from datetime import datetime, timedelta
-
+from dateutil import parser
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from google.auth.transport.requests import Request
@@ -48,81 +48,6 @@ class CalendarService:
     
         return creds
 
-
-
-    # def fetch_existing_events(self, start_dt, end_dt, timezone='Asia/Kolkata'):
-    #     """
-    #     Fetch existing events from Google Calendar within the specified date range,
-    #     returning titles and times converted to the specified timezone.
-        
-    #     Args:
-    #         start_dt (datetime): Start of the date range (timezone-aware or UTC) eg.2025-08-16T10:37:28.559Z to 2025-08-23T10:37:28.491Z
-    #         end_dt (datetime): End of the date range (timezone-aware or UTC)
-    #         timezone (str): Target timezone for event times (default: Asia/Kolkata)
-        
-    #     Returns:
-    #         list: List of dictionaries containing event title, start, and end times
-    #     """
-    #     try:
-    #         # Validate inputs
-    #         if not isinstance(start_dt, datetime) or not isinstance(end_dt, datetime):
-    #             raise ValueError("start_dt and end_dt must be datetime objects")
-    #         validate_timezone(timezone)
-    #         tz = pytz.timezone(timezone)
-
-    #         # Ensure start_dt and end_dt are timezone-aware
-    #         if start_dt.tzinfo is None:
-    #             start_dt = start_dt.replace(tzinfo=pytz.UTC)
-    #         if end_dt.tzinfo is None:
-    #             end_dt = end_dt.replace(tzinfo=pytz.UTC)
-
-    #         # Build Google Calendar service
-    #         service = build('calendar', 'v3', credentials=self.credentials)
-            
-    #         # Fetch events
-    #         events_result = service.events().list(
-    #             calendarId='primary',
-    #             timeMin=start_dt.isoformat(),
-    #             timeMax=end_dt.isoformat(),
-    #             singleEvents=True,
-    #             orderBy='startTime',
-    #             fields="items(summary,start(dateTime),end(dateTime))"  # Explicitly include summary, start, end
-    #         ).execute()
-
-    #         events = events_result.get('items', [])
-    #         formatted_events = []
-
-    #         # Process each event
-    #         for event in events:
-    #             title = event.get('summary', 'Untitled Event')  # Default to 'Untitled Event' if no summary
-    #             start_str = event.get('start', {}).get('dateTime')
-    #             end_str = event.get('end', {}).get('dateTime')
-
-    #             if start_str and end_str:
-    #                 try:
-    #                     # Parse event times and convert to target timezone
-    #                     start_dt = datetime.fromisoformat(start_str).astimezone(tz)
-    #                     end_dt = datetime.fromisoformat(end_str).astimezone(tz)
-                        
-    #                     formatted_events.append({
-    #                         'title': title,
-    #                         'start': start_dt.strftime("%Y-%m-%d %H:%M:%S %Z"),
-    #                         'end': end_dt.strftime("%Y-%m-%d %H:%M:%S %Z")
-    #                     })
-    #                 except ValueError as e:
-    #                     print(f"Skipping event '{title}' due to invalid date format: {str(e)}")
-    #                     continue
-
-    #         return formatted_events
-
-    #     except Exception as e:
-    #         raise Exception(f"Error fetching events: {str(e)}")
-    #     finally:
-    #         # Delete token file
-    #         if os.path.exists(self.token_path):
-    #             # os.remove(self.token_path)
-    #             print("🗑️ Token file deleted.")
-
     def has_conflict_with_buffer(self, existing_events, new_start, new_end):
         for event in existing_events:
             start = event['start'].get('dateTime')
@@ -163,20 +88,33 @@ class CalendarService:
     def schedule_event(self, title, start_dt, end_dt, timezone, attendees=None):
         service = build('calendar', 'v3', credentials=self.credentials)
         try:
-            tz = validate_timezone(timezone)
             event = {
-                'summary': title,
-                'start': {'dateTime': start_dt.isoformat(), 'timeZone': timezone},
-                'end': {'dateTime': end_dt.isoformat(), 'timeZone': timezone},
+            'summary': title,
+            'start': {'dateTime': start_dt.isoformat(), 'timeZone': timezone},
+            'end': {'dateTime': end_dt.isoformat(), 'timeZone': timezone},
+            'attendees': [] # Start with an empty list
             }
+
+        
+        # We validate each attendee before adding them to the event.
             if attendees:
-                event['attendees'] = [{'email': email} for email in attendees]
+                valid_attendees = []
+                for email in attendees:
+                # A simple but effective check for a valid email format
+                    if isinstance(email, str) and '@' in email:
+                        valid_attendees.append({'email': email})
+                    else:
+                        logger.warning(f"Skipping invalid attendee entry: {email}")
+            
+            if valid_attendees:
+                event['attendees'] = valid_attendees
+        
+
             created_event = service.events().insert(calendarId='primary', body=event).execute()
-            return created_event.get('htmlLink')
-        finally:
-            if os.path.exists(self.token_path):
-                os.remove(self.token_path)
-            print("🗑️ Token file deleted.")
+            return created_event
+        except Exception as e:
+            logger.error(f"Failed to schedule event: {e}", exc_info=True)
+            raise e
 
     def intelligent_schedule_handler(self, gpt_data):
         title = gpt_data.get('title')
@@ -240,24 +178,7 @@ class CalendarService:
             'link': meeting_link
         }
 
-    # def get_availability(self, start: str, end: str, timezone: str):
-    #     try:
-    #         validate_timezone(timezone)
-    #         start_dt = parse_datetime(start)
-    #         end_dt = parse_datetime(end)
-    #         events = self.fetch_existing_events(start_dt, end_dt)
-    #         tz = pytz.timezone(timezone)
-    #         return [{
-    #             'start': datetime.fromisoformat(event['start']['dateTime']).astimezone(tz).isoformat(),
-    #             'end': datetime.fromisoformat(event['end']['dateTime']).astimezone(tz).isoformat()
-    #         } for event in events]
-    #     except ValueError as e:
-    #         raise ValueError(f"Invalid timezone or date format: {str(e)}")
-    #     finally:
-    #         if os.path.exists(self.token_path):
-    #             os.remove(self.token_path)
-    #             print("🗑️ Token file deleted.")
-  # In core/calendar_service.py
+
 
     def fetch_existing_events(self, start_dt, end_dt, timezone='UTC'):
         """
@@ -322,6 +243,8 @@ class CalendarService:
         
             processed_events = []
             for event in events:
+                start_time_aware = parser.parse(event['start']['dateTime'])
+                end_time_aware = parser.parse(event['end']['dateTime'])
                 processed_event = {
                 'title': event.get('summary', 'No Title'),
                 'description': event.get('description', ''),
@@ -336,8 +259,8 @@ class CalendarService:
                 'htmlLink': event.get('htmlLink', ''),
                 'recurrence': event.get('recurrence', []),           # Added recurrence
                 'recurringEventId': event.get('recurringEventId', ''), # Added recurringEventId
-                'start': datetime.fromisoformat(event['start']['dateTime']).astimezone(tz).isoformat(),
-                'end': datetime.fromisoformat(event['end']['dateTime']).astimezone(tz).isoformat(),
+                'start': start_time_aware.astimezone(tz).isoformat(),
+                'end': end_time_aware.astimezone(tz).isoformat(),
                     }
                 processed_events.append(processed_event)
             

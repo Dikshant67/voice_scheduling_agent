@@ -15,78 +15,69 @@ class GPTAgent:
             azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT")
         )
         self.logger = logging.getLogger(__name__)
-        # <-- CHANGE: Removed the stale self.date and self.time from here
-
-    # <-- CHANGE: The method now accepts the 'context' dictionary
+    
     def process_input(self, text: str, context: dict) -> tuple[str, dict]:
-        try:
-            # <-- CHANGE: Get date, time, and timezone for EACH request
-            current_date = datetime.datetime.now().strftime("%Y-%m-%d")
-            current_time = datetime.datetime.now().strftime("%H:%M:%S")
-            user_timezone = context.get('timezone', 'UTC') # Get timezone from context
-
-            self.logger.info(f"Processing input with context: '{text}' (Timezone: {user_timezone})")
-            
-            # <-- CHANGE: Converted the prompt to an f-string to inject real-time data
-            prompt = f"""
-            You are a highly intelligent voice assistant for scheduling meetings.
-            Your task is to accurately extract the intent and entities from the user's request.
-            The intent must be either 'schedule_meeting' or 'other'.
-
-            IMPORTANT CONTEXT:
-            - The current date is: {current_date}
-            - The current time is: {current_time}
-            - The user's local timezone is: {user_timezone}
-
-            When the user says "tomorrow", you must calculate the correct date based on the current date.
-            When the user gives a relative time like "in 2 hours", calculate it based on the current time.
-            If the user does not specify a title, create a sensible one like "Meeting with [Attendees]".
-
-            Entities to extract:
-            - title: Meeting title (string)
-            - date: Date in YYYY-MM-DD format (string).
-            - time: Time in HH:MM format (24-hour clock) (string).
-            - attendees: List of attendee names or emails (list of strings, optional).
-            - reply: A polite, natural language response ONLY if the intent is 'other' (string, optional).
-
-            You MUST return the result as a single, well-formed JSON object with 'intent' and 'entities' keys.
-
-            Example 1:
-            User input: "Schedule a meeting with John tomorrow at 3 PM"
-            Output: {{
-                "intent": "schedule_meeting",
-                "entities": {{
-                    "title": "Meeting with John",
-                    "date": "{ (datetime.date.today() + datetime.timedelta(days=1)).strftime('%Y-%m-%d') }",
-                    "time": "15:00",
-                    "attendees": ["John"]
-                }}
-            }}
-
-            Example 2:
-            User input: "what's the weather like"
-            Output: {{
-                "intent": "other",
-                "entities": {{
-                    "reply": "I can only help with scheduling meetings. I can't check the weather for you."
-                }}
-            }}
-            """
-
-            response = self.client.chat.completions.create(
-                model="gpt-4o", # Or your preferred model
-                messages=[
-                    {"role": "system", "content": prompt},
-                    {"role": "user", "content": text}
-                ],
-                response_format={"type": "json_object"}
-            )
-            result = json.loads(response.choices[0].message.content)
-            intent = result.get("intent", "other")
-            entities = result.get("entities", {})
-            self.logger.info(f"GPT Result: intent={intent}, entities={entities}")
-            return intent, entities
-            
-        except Exception as e:
-            self.logger.error(f"GPT error: {str(e)}", exc_info=True)
-            return "other", {"reply": f"I had an issue processing your request with the AI model."}
+            try:
+                current_date = datetime.datetime.now().strftime("%Y-%m-%d")
+                current_time = datetime.datetime.now().strftime("%H:%M:%S")
+                user_timezone = context.get('timezone', 'UTC')
+                partial_details = context.get('partial_meeting_details', {})
+                
+                # --- THIS IS THE UPGRADE ---
+                # We now format the full conversation history for the AI to see.
+                previous_interactions = context.get('previous_interactions', [])
+                history_str = "\n".join([
+                    f"- User said: \"{turn['input']}\" (AI interpreted intent: {turn['intent']})" 
+                    for turn in previous_interactions
+                ])
+                if not history_str:
+                    history_str = "No previous conversation history."
+                # --- END OF UPGRADE ---
+    
+                self.logger.info(f"Processing input: '{text}' (History: {len(previous_interactions)} turns)")
+                
+                prompt = f"""
+                You are a stateful, context-aware voice assistant for scheduling meetings.
+                Your goal is to complete the meeting details by having a natural conversation.
+    
+                # Context
+                - Current date is: {current_date}
+                - User's timezone is: {user_timezone}
+    
+                # Conversation History (Most recent is last)
+                {history_str}
+    
+                # Details Gathered So Far
+                {json.dumps(partial_details)}
+    
+                # Instructions
+                1.  Analyze the user's VERY LATEST input: "{text}".
+                2.  Refer to the 'Conversation History' and 'Details Gathered So Far' to understand the full context.
+                3.  The user's latest input might be an ANSWER to a previous question, a CORRECTION, or a new piece of information.
+                4.  Intelligently combine the user's latest input with the details already gathered.
+                5.  If the user says "with John" and the title is empty, set the title to "Meeting with John".
+                6.  If the user corrects a detail (e.g., "no, make it 5 PM"), update the existing detail.
+                7.  Your final output must be a single JSON object with the most up-to-date entities.
+    
+                # JSON Output Format
+                - intent: 'schedule_meeting' or 'other'.
+                - entities: A JSON object with keys like 'title', 'date', 'time', 'attendees'.
+                """
+    
+                response = self.client.chat.completions.create(
+                    model="gpt-4o",
+                    messages=[
+                        {"role": "system", "content": prompt},
+                    
+                    ],
+                    response_format={"type": "json_object"}
+                )
+                result = json.loads(response.choices[0].message.content)
+                intent = result.get("intent", "other")
+                entities = result.get("entities", {})
+                self.logger.info(f"GPT Result: intent={intent}, entities={entities}")
+                return intent, entities
+                
+            except Exception as e:
+                self.logger.error(f"GPT error: {str(e)}", exc_info=True)
+                return "other", {"reply": "I had an issue processing your request with the AI model."}

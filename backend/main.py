@@ -54,24 +54,62 @@ class ConnectionManager:
     def __init__(self):
         self.active_sessions: Dict[int, Dict[str, Any]] = {}
         self.audio_processors: Dict[int, SmartAudioProcessor] = {}
+        self.connection_timestamps: Dict[str, float] = {} # Tracks last connection time per IP
         logger.info("ConnectionManager initialized.")
 
-    async def connect(self, websocket: WebSocket) -> int:
-        await websocket.accept()
+    async def connect(self, websocket: WebSocket) -> Optional[int]:
+        try:
+            # 1. Always accept the connection first.
+            await websocket.accept()
+        except WebSocketDisconnect:
+            logger.warning("Client disconnected immediately upon connection.")
+            return None
+
+        client_ip = websocket.client.host if websocket.client else "unknown"
+        current_time = time.time()
+        
+        # 2. Perform Rate Limiting check.
+        last_connection_time = self.connection_timestamps.get(client_ip, 0)
+        if current_time - last_connection_time < 1.0: # Limit to 1 connection per second
+            logger.warning(f"RATE LIMIT: Too many connection attempts from IP: {client_ip}")
+            await websocket.close(code=1008, reason="Rate limit exceeded. Please wait a moment.")
+            return None # Signal that the connection failed
+        
+        # 3. If the connection is allowed, update the timestamp.
+        self.connection_timestamps[client_ip] = current_time
+
+        # 4. Clean up any other old/stale sessions from the same IP address.
+        self._cleanup_old_sessions_from_ip(client_ip)
+        
+        # 5. Create and store the new, valid session.
         session_id = id(websocket)
         self.audio_processors[session_id] = SmartAudioProcessor()
         self.active_sessions[session_id] = {
             'id': session_id,
             'websocket': websocket,
+            'client_ip': client_ip, # Store the IP for tracking
             'timezone': 'UTC',
             'is_recording': False,
             'processing_lock': asyncio.Lock(),
             'greeting_sent': False,
-            'start_time': time.time(),
-            'interaction_history': []
+            'start_time': current_time,
+            'interaction_history': [],
+            'partial_meeting_details': {}
         }
-        logger.info("New connection established", extra={"session_id": session_id})
+        logger.info(f"New connection established from {client_ip}", extra={"session_id": session_id})
         return session_id
+
+    def _cleanup_old_sessions_from_ip(self, client_ip: str):
+        """Finds and disconnects any old sessions from the same IP to prevent orphans."""
+        # It's safer to iterate over a copy of the items
+        current_sessions = list(self.active_sessions.items())
+        
+        for session_id, session in current_sessions:
+            if session.get('client_ip') == client_ip and session_id != id(session['websocket']):
+                logger.warning(f"Cleaning up old session {session_id} from same IP {client_ip}")
+                # We can't await in a sync function, so we need to schedule the close
+                # For simplicity, we'll just disconnect it from our manager
+                self.disconnect(session_id)
 
     def disconnect(self, session_id: int):
         if session_id in self.active_sessions:
@@ -79,6 +117,7 @@ class ConnectionManager:
         if session_id in self.audio_processors:
             del self.audio_processors[session_id]
         logger.info("Connection closed and resources cleaned up", extra={"session_id": session_id})
+
 
     def get_session(self, session_id: int) -> Optional[Dict[str, Any]]:
         return self.active_sessions.get(session_id)
@@ -92,18 +131,55 @@ manager = ConnectionManager()
 # 5. FASTAPI APP SETUP (LIFESPAN, CORS)
 # ==============================================================================
 services = {}
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("Application starting up...")
-    config = Config()
-    services["calendar"] = CalendarService()
-    services["text_to_voice"] = TextToVoice(config.azure_speech_key, config.azure_speech_region)
-    services["gpt_agent"] = GPTAgent()
-    logger.info("All services have been initialized successfully.")
+    logger.info("--- Application starting up... ---")
+    
+    # --- THIS IS THE FIX ---
+    # We will initialize each service in its own try/except block
+    # to get detailed error messages if one fails.
+    
+    try:
+        config = Config()
+        
+        # Initialize Calendar Service
+        try:
+            services["calendar"] = CalendarService()
+            app.state.calender_service = CalendarService()
+            logger.info("✅ CalendarService initialized.")
+        except Exception as e:
+            logger.error(f"❌ CalendarService initialization failed: {e}", exc_info=True)
+            # Don't continue if critical services fail
+            raise e
+        
+        # Initialize TextToVoice Service
+        logger.info("Initializing TextToVoice service...")
+        if not config.azure_speech_key or not config.azure_speech_region:
+            raise ValueError("AZURE_SPEECH_KEY or AZURE_SPEECH_REGION is missing from .env file.")
+        # services["text_to_voice"] = TextToVoice(config.azure_speech_key, config.azure_speech_region)
+        app.state.text_to_voice=TextToVoice(config.azure_speech_key, config.azure_speech_region)
+        logger.info("✅ TextToVoice service initialized.")
+
+        # Initialize GPTAgent Service
+        logger.info("Initializing GPTAgent...")
+        # app.state.gpt_agent = GPTAgent()
+        services["gpt_agent"] = GPTAgent()
+        
+        logger.info("✅ GPTAgent initialized.")
+
+        logger.info("--- All services have been initialized successfully. ---")
+
+    except Exception as e:
+        # If any service fails, this will log the critical error.
+        logger.critical(f"FATAL ERROR during service initialization: {e}", exc_info=True)
+    # --- END OF FIX ---
+
     yield
-    logger.info("Application shutting down...")
+    
+    logger.info("--- Application shutting down... ---")
+    
     services.clear()
+
 
 app = FastAPI(lifespan=lifespan)
 
@@ -135,6 +211,9 @@ async def websocket_endpoint(websocket: WebSocket):
             session['greeting_sent'] = True
         
         while True:
+            if websocket.client_state.name == "DISCONNECTED":
+                logger.info("Client already disconnected, breaking loop.", extra={"session_id": session_id})
+                break
             message = await websocket.receive()
             if message.get("type") == "websocket.receive":
                 if "text" in message:
@@ -191,7 +270,7 @@ async def process_complete_audio(websocket: WebSocket, session: dict):
             await websocket.send_json({"type": "transcription", "text": user_input or "", "session_id": session_id})
 
             if not user_input:
-                await send_audio_response(websocket, "I couldn't quite understand that.", "unclear_speech", session)
+                await send_audio_response(websocket, "", "unclear_speech", session)
                 return
             
             logger.info(f"Transcription: '{user_input}'", extra={"session_id": session_id})
@@ -233,7 +312,7 @@ async def process_with_gpt(user_input: str, session: dict) -> tuple:
         # Combine old and new entities
         final_entities = {**partial_details, **new_entities}
         
-        session.get('interaction_history', []).append({'input': user_input, 'intent': intent})
+        session['interaction_history'].append({'input': user_input, 'intent': intent})
         
         # Return the combined result
         return intent, final_entities
@@ -243,24 +322,42 @@ async def process_with_gpt(user_input: str, session: dict) -> tuple:
         raise e
 
 async def process_meeting_scheduling(websocket: WebSocket, entities: dict, session: dict):
-    try:
-        text_to_voice = services.get("text_to_voice")
-        calendar_service = services.get("calendar")
-        
-        completed_entities = await fill_missing_fields_async(entities, text_to_voice, websocket, session)
-        if not completed_entities: return # Conversation is ongoing
-        
-        result = calendar_service.intelligent_schedule_handler(completed_entities)
-        
-        if result.get('status') == 'success' or result.get('status') == 'scheduled':
-            response_text = f"Perfect! I've successfully scheduled '{result.get('title')}' for {result.get('start')}."
-        else:
-            response_text = f"I couldn't schedule the meeting: {result.get('message')}."
-        
-        await send_audio_response(websocket, response_text, "meeting_result", session, {"event_details": result})
-    except Exception as e:
-        logger.error(f"💥 Meeting scheduling error: {e}", exc_info=True)
-        await send_audio_response(websocket, f"Sorry, scheduling failed.", "error", session)
+        session_id = session.get('id', 'unknown')
+        try:
+            logger.info("Attempting to schedule meeting with entities.", extra={"session_id": session_id})
+            
+            text_to_voice =  _get_state_service(websocket, "text_to_voice") or services.get("text_to_voice")
+            calendar_service = services.get("calendar")
+            if not text_to_voice or not calendar_service:
+                raise Exception("A required service (TTS or Calendar) is not available.")
+    
+            # This function will now handle the conversation flow correctly.
+            completed_entities = await fill_missing_fields_async(entities, text_to_voice, websocket, session)
+            
+            # If fill_missing_fields_async returned None, it means it asked a question and is waiting.
+            # So we stop here and wait for the user's next input.
+            if not completed_entities:
+                logger.info("Awaiting more information from the user.", extra={"session_id": session_id})
+                return
+    
+            # If we have all the details, proceed to schedule.
+            logger.info(f"All details gathered. Scheduling event: {completed_entities}", extra={"session_id": session_id})
+            result = calendar_service.intelligent_schedule_handler(completed_entities)
+            
+            # The 'event_details' is now the full event object returned by schedule_event
+            meeting_details = result.get('event_details', {})
+            
+            if result.get('status') == 'scheduled':
+                response_text = f"Perfect! I've successfully scheduled '{meeting_details.get('summary')}'."
+            else:
+                response_text = f"I couldn't schedule the meeting: {result.get('message')}."
+            
+            await send_audio_response(websocket, response_text, "meeting_result", session, {"event_details": meeting_details})
+    
+        except Exception as e:
+            logger.error(f"💥 Meeting scheduling error: {e}", extra={"session_id": session_id}, exc_info=True)
+            await send_audio_response(websocket, "Sorry, I ran into an error while trying to schedule the meeting.", "error", session)
+       
 
 # ==============================================================================
 # 8. HTTP ENDPOINTS
@@ -270,8 +367,8 @@ async def read_root():
     return {"message": "🎤 Voice-based Meeting Scheduler API v3.0"}
 
 @app.get("/calendar/availability-test")
-async def test_availability(start: str, end: str, timezone: str):
-    calendar_service = services.get("calendar")
+async def test_availability(start: str, end: str, timezone: str,websocket : WebSocket):
+    calendar_service =  _get_state_service(websocket, "calendar") or services.get("calendar")
     if not calendar_service:
         raise HTTPException(status_code=500, detail="Calendar service not loaded")
     try:
@@ -285,6 +382,12 @@ async def test_availability(start: str, end: str, timezone: str):
 # ==============================================================================
 # 9. HELPER FUNCTIONS
 # ==============================================================================
+def _get_state_service(websocket: WebSocket, name: str):
+    try:
+        return getattr(websocket.app.state, name, None)
+    except Exception:
+        return None
+
 def save_pcm_as_wav(audio_buffer: bytearray) -> Optional[str]:
     try:
         temp_fd, temp_path = tempfile.mkstemp(suffix='.wav')
@@ -307,20 +410,49 @@ def cleanup_temp_file(file_path: str):
         logger.warning(f"⚠️ Failed to cleanup temp file {file_path}: {e}")
 
 async def send_audio_response(websocket: WebSocket, text: str, response_type: str, session: dict, extra_data: dict = None):
+    session_id = session.get('id', 'unknown')
+    
+    # Check if WebSocket is still connected
+    try:
+        if websocket.client_state.name == "DISCONNECTED":
+            logger.warning("WebSocket disconnected, cannot send response.", extra={"session_id": session_id})
+            return
+    except AttributeError:
+        logger.warning("Cannot check WebSocket state.", extra={"session_id": session_id})
+    
     try:
         response_data = {
-            "type": response_type, "message": text, "session_id": session['id']
+            "type": response_type,
+            "message": text,
+            "session_id": session_id,
+            "timestamp": datetime.now().isoformat()
         }
-        if extra_data: response_data.update(extra_data)
+        if extra_data:
+            response_data.update(extra_data)
         
-        text_to_voice = services.get("text_to_voice")
-        audio_response = text_to_voice.synthesize(text)
-        if audio_response:
-            response_data["audio"] = audio_response.hex()
-        
+        text_to_voice =  _get_state_service(websocket, "text_to_voice") or services.get("text_to_voice")
+        if text_to_voice:
+            logger.info(f"🗣️ Synthesizing: {text}", extra={"session_id": session_id})
+            try:
+                audio_response = text_to_voice.synthesize(text)
+                if audio_response and len(audio_response) > 0:
+                    logger.info(f"🔊 Synthesis successful: {len(audio_response)} bytes", extra={"session_id": session_id})
+                    response_data["audio"] = audio_response.hex()
+                else:
+                    logger.warning("Audio synthesis returned empty.", extra={"session_id": session_id})
+            except Exception as e:
+                logger.error(f"Audio synthesis failed: {e}", extra={"session_id": session_id})
+        else:
+            logger.warning("TextToVoice service not found. Sending response without audio.", extra={"session_id": session_id})
+            
         await websocket.send_json(response_data)
+        logger.info(f"🗣️ Sent response [{response_type}] to client.", extra={"session_id": session_id})
+        
+    except WebSocketDisconnect:
+        logger.warning(f"Client disconnected before response could be sent.", extra={"session_id": session_id})
     except Exception as e:
-        logger.error(f"💥 Error sending response to {session['id']}: {e}", exc_info=True)
+        logger.error(f"💥 Error in send_audio_response: {e}", extra={"session_id": session_id}, exc_info=True)
+
 
 # ==============================================================================
 # 10. SERVER RUN

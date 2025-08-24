@@ -313,6 +313,14 @@ export default function EnhancedScheduleVoiceFramework() {
         if (data.audio) await playAudioFromHex(data.audio);
         toast.error(data.message || "An error occurred");
         break;
+      case "clarification":
+        setIsProcessing(false); // Stop the processing spinner
+        addMessage(`🤔 Assistant asks: "${data.message}"`);
+        if (data.audio) {
+          await playAudioFromHex(data.audio); // Play the audio of the question
+        }
+        toast.info("Assistant needs more information...");
+        break;
       default:
         console.log("🤷 Unknown message type:", data.type);
         break;

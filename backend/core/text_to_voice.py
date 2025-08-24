@@ -13,9 +13,7 @@ class TextToVoice:
         # Set audio format to WAV for frontend compatibility
         self.speech_config.set_speech_synthesis_output_format(
             speechsdk.SpeechSynthesisOutputFormat.Riff16Khz16BitMonoPcm
-        )
-        
-        
+        )   
         self.logger = logging.getLogger(__name__)
 
     def synthesize(self, text: str) -> bytes:
