@@ -9,11 +9,31 @@ def is_valid_date(date_str: str) -> bool:
         return False
 
 def is_valid_time(time_str: str) -> bool:
-    try:
-        datetime.strptime(time_str, "%H:%M")
-        return True
-    except ValueError:
+    """
+    Validates time string in multiple formats:
+    - 24-hour format: "14:30", "09:00"
+    - 12-hour format with AM/PM: "2:30 PM", "09:00 AM", "05:00 AM"
+    """
+    if not time_str:
         return False
+    
+    time_str = time_str.strip()
+    
+    # List of supported time formats
+    time_formats = [
+        "%H:%M",        # 24-hour format: "14:30"
+        "%I:%M %p",     # 12-hour format with AM/PM: "2:30 PM"
+        "%I:%M%p",      # 12-hour format without space: "2:30PM"
+    ]
+    
+    for time_format in time_formats:
+        try:
+            datetime.strptime(time_str, time_format)
+            return True
+        except ValueError:
+            continue
+    
+    return False
 
 def validate_meeting_details(entities: dict):
     required = ["title", "date", "time", "timezone"]

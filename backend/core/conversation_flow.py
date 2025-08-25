@@ -44,16 +44,11 @@ async def fill_missing_fields_async(entities: dict, text_to_voice: TextToVoice, 
             return None
 
    
-    # Now, check if attendees are valid emails
-    if 'attendees' in combined_details and combined_details['attendees']:
-        for attendee in combined_details['attendees']:
-            if '@' not in attendee:
-                # Found a name without an email address
-                session['partial_meeting_details'] = combined_details
-                question = f"What is the email address for {attendee}?"
-                await send_audio_response(websocket, question, "clarification", session)
-                return None # Stop and wait for the user's answer
-    
+    # Note: Email validation for attendees is now optional
+    # The calendar service will handle attendees gracefully:
+    # - Valid emails will be added as attendees
+    # - Names without emails will be skipped (logged as warning)
+    # This provides a better user experience for basic meeting scheduling
 
     # If we get here, all information is complete
     session.pop('partial_meeting_details', None)

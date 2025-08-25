@@ -145,7 +145,7 @@ async def lifespan(app: FastAPI):
         # Initialize Calendar Service
         try:
             services["calendar"] = CalendarService()
-            app.state.calender_service = CalendarService()
+            # app.state.calender_service = CalendarService()
             logger.info("✅ CalendarService initialized.")
         except Exception as e:
             logger.error(f"❌ CalendarService initialization failed: {e}", exc_info=True)
@@ -326,7 +326,7 @@ async def process_meeting_scheduling(websocket: WebSocket, entities: dict, sessi
         try:
             logger.info("Attempting to schedule meeting with entities.", extra={"session_id": session_id})
             
-            text_to_voice =  _get_state_service(websocket, "text_to_voice") or services.get("text_to_voice")
+            text_to_voice =  _get_state_service(websocket, "text_to_voice") 
             calendar_service = services.get("calendar")
             if not text_to_voice or not calendar_service:
                 raise Exception("A required service (TTS or Calendar) is not available.")
@@ -348,7 +348,9 @@ async def process_meeting_scheduling(websocket: WebSocket, entities: dict, sessi
             meeting_details = result.get('event_details', {})
             
             if result.get('status') == 'scheduled':
-                response_text = f"Perfect! I've successfully scheduled '{meeting_details.get('summary')}'."
+                # Use the title from event details, or fall back to the original title
+                meeting_title = meeting_details.get('summary') or completed_entities.get('title', 'your meeting')
+                response_text = f"Perfect! I've successfully scheduled '{meeting_title}'."
             else:
                 response_text = f"I couldn't schedule the meeting: {result.get('message')}."
             
@@ -367,8 +369,9 @@ async def read_root():
     return {"message": "🎤 Voice-based Meeting Scheduler API v3.0"}
 
 @app.get("/calendar/availability-test")
-async def test_availability(start: str, end: str, timezone: str,websocket : WebSocket):
-    calendar_service =  _get_state_service(websocket, "calendar") or services.get("calendar")
+async def test_availability(start: str, end: str, timezone: str):
+    # calendar_service =  _get_state_service(websocket, "calendar") or services.get("calendar")
+    calendar_service = services.get("calendar")
     if not calendar_service:
         raise HTTPException(status_code=500, detail="Calendar service not loaded")
     try:
@@ -430,7 +433,7 @@ async def send_audio_response(websocket: WebSocket, text: str, response_type: st
         if extra_data:
             response_data.update(extra_data)
         
-        text_to_voice =  _get_state_service(websocket, "text_to_voice") or services.get("text_to_voice")
+        text_to_voice =  _get_state_service(websocket, "text_to_voice") 
         if text_to_voice:
             logger.info(f"🗣️ Synthesizing: {text}", extra={"session_id": session_id})
             try:

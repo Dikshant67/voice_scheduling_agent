@@ -85,6 +85,32 @@ class CalendarService:
 
         return current
 
+    def convert_time_to_24hour(self, time_str: str) -> str:
+        """
+        Convert time string from various formats to 24-hour format (HH:MM).
+        Handles: "4:00 PM", "04:00 PM", "16:00", "4:00PM", etc.
+        """
+        if not time_str:
+            raise ValueError("Empty time string")
+        
+        time_str = time_str.strip()
+        
+        # List of supported time formats
+        time_formats = [
+            "%H:%M",        # 24-hour format: "16:00"
+            "%I:%M %p",     # 12-hour format with space: "4:00 PM"
+            "%I:%M%p",      # 12-hour format without space: "4:00PM"
+        ]
+        
+        for time_format in time_formats:
+            try:
+                parsed_time = datetime.strptime(time_str, time_format)
+                return parsed_time.strftime("%H:%M")  # Always return 24-hour format
+            except ValueError:
+                continue
+        
+        raise ValueError(f"Unable to parse time format: {time_str}")
+
     def schedule_event(self, title, start_dt, end_dt, timezone, attendees=None):
         service = build('calendar', 'v3', credentials=self.credentials)
         try:
@@ -144,8 +170,10 @@ class CalendarService:
             }
 
         try:
+            # Convert time to 24-hour format before parsing
+            time_24h = self.convert_time_to_24hour(time_str)
             tz = pytz.timezone(timezone)
-            start_dt = tz.localize(datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M"))
+            start_dt = tz.localize(datetime.strptime(f"{date_str} {time_24h}", "%Y-%m-%d %H:%M"))
             end_dt = start_dt + timedelta(minutes=self.DEFAULT_MEETING_DURATION)
         except Exception as e:
             return {
@@ -169,13 +197,14 @@ class CalendarService:
                 'timezone': timezone
             }
 
-        meeting_link = self.schedule_event(title, start_dt, end_dt, timezone, attendees)
+        created_event = self.schedule_event(title, start_dt, end_dt, timezone, attendees)
         return {
             'status': 'scheduled',
             'start': start_dt.strftime("%Y-%m-%d %H:%M"),
             'end': end_dt.strftime("%Y-%m-%d %H:%M"),
             'timezone': timezone,
-            'link': meeting_link
+            'event_details': created_event,  # Include the full event details
+            'link': created_event.get('htmlLink', '') if created_event else ''
         }
 
 
