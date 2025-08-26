@@ -94,7 +94,8 @@ class ConnectionManager:
             'greeting_sent': False,
             'start_time': current_time,
             'interaction_history': [],
-            'partial_meeting_details': {}
+            'partial_meeting_details': {},
+            'had_user_speech': False  # Track if we have received any meaningful speech yet
         }
         logger.info(f"New connection established from {client_ip}", extra={"session_id": session_id})
         return session_id
@@ -219,17 +220,47 @@ async def websocket_endpoint(websocket: WebSocket):
                 if "text" in message:
                     try:
                         data = json.loads(message["text"])
+                        message_type = data.get("type")
                         event = data.get("event")
-                        if event == "start_recording":
+                        
+                        if message_type == "config":
+                            # Handle configuration message from frontend
+                            logger.info(f"Received configuration: timezone={data.get('timezone')}, voice={data.get('voice')}", extra={"session_id": session_id})
+                            session['timezone'] = data.get('timezone', 'UTC')
+                            session['voice'] = data.get('voice', 'en-IN-NeerjaNeural')
+                            # Send confirmation back to frontend
+                            await websocket.send_text(json.dumps({
+                                "type": "config_received",
+                                "message": f"Configuration updated: {session['timezone']}, {session['voice']}",
+                                "session_id": session_id
+                            }))
+                        elif event == "start_recording":
                             logger.info("Event: 'start_recording'. Enabling recording.", extra={"session_id": session_id})
                             processor.reset()
                             session['is_recording'] = True
-                            session['timezone'] = data.get('timezone', 'UTC')
+                            session['timezone'] = data.get('timezone', session.get('timezone', 'UTC'))
                         elif event == "stop_recording":
                             logger.info("Event: 'stop_recording'. Processing final audio.", extra={"session_id": session_id})
                             session['is_recording'] = False
                             if len(processor.get_complete_audio()) > 0:
                                 await process_complete_audio(websocket, session)
+                        elif message_type == "client_text":
+                            # Frontend sent a direct text command (e.g., option selection)
+                            user_input = data.get("text", "")
+                            logger.info(f"Received client_text: '{user_input}'", extra={"session_id": session_id})
+                            if not user_input:
+                                return
+                            session['had_user_speech'] = True
+                            if session.get('awaiting_conflict_resolution'):
+                                await handle_conflict_resolution_response(websocket, user_input, session)
+                            else:
+                                intent, entities = await process_with_gpt(user_input, session)
+                                if intent == "schedule_meeting":
+                                    entities['timezone'] = session.get('timezone', 'UTC')
+                                    await process_meeting_scheduling(websocket, entities, session)
+                                else:
+                                    reply = entities.get("reply", "I can only help schedule meetings.")
+                                    await send_audio_response(websocket, reply, "clarification", session)
                     except Exception as e:
                         logger.error(f"Error handling control message: {e}", extra={"session_id": session_id}, exc_info=True)
                 elif "bytes" in message:
@@ -256,8 +287,19 @@ async def process_complete_audio(websocket: WebSocket, session: dict):
         audio_duration = len(complete_audio) / (SAMPLE_RATE * BYTES_PER_SAMPLE)
         logger.info(f"Processing audio segment of {audio_duration:.2f}s", extra={"session_id": session_id})
 
-        if audio_duration < 0.5:
-            await send_audio_response(websocket, "I didn't hear enough audio, please try again.", "insufficient_audio", session)
+        # Allow very short replies (e.g., "option 1") during conflict selection
+        if audio_duration < 0.5 and not session.get('awaiting_conflict_resolution'):
+            # If no meaningful speech has occurred since the start, send a one-time helpful prompt without audio
+            if not session.get('had_user_speech') and not session.get('greeting_sent'):
+                await send_audio_response(
+                    websocket,
+                    "I can help you manage your meeting. For example, say 'Schedule a meeting tomorrow at 10 AM'.",
+                    "prompt",
+                    session,
+                    {"mute_audio": True}
+                )
+                session['greeting_sent'] = True
+            # Otherwise, remain silent on very short audio
             return
 
         temp_file = None
@@ -267,13 +309,42 @@ async def process_complete_audio(websocket: WebSocket, session: dict):
             if not temp_file: raise Exception("Failed to save audio to WAV file.")
 
             user_input = await enhanced_speech_to_text(temp_file)
+            logger.info(f"Raw transcription result: '{user_input}' (type: {type(user_input)})", extra={"session_id": session_id})
+            
             await websocket.send_json({"type": "transcription", "text": user_input or "", "session_id": session_id})
 
-            if not user_input:
-                await send_audio_response(websocket, "", "unclear_speech", session)
+            if not user_input or user_input.strip() == "":
+                logger.warning(f"Empty transcription received for session {session_id}", extra={"session_id": session_id})
+                # If awaiting a conflict selection, prompt the user instead of staying silent
+                if session.get('awaiting_conflict_resolution'):
+                    await send_audio_response(
+                        websocket,
+                        "I didn't catch that. Please say 'option 1', 'option 2', or 'option 3'.",
+                        "clarification",
+                        session,
+                        {"mute_audio": True, "retry_conflict_resolution": True, "conflict_data": session.get('conflict_data')}
+                    )
+                    return
+                # If this is the first interaction and it's silence, show a one-time prompt without TTS
+                if not session.get('had_user_speech') and not session.get('greeting_sent'):
+                    await send_audio_response(
+                        websocket,
+                        "I can help you manage your meeting. For example, say 'Schedule a meeting tomorrow at 10 AM'.",
+                        "prompt",
+                        session,
+                        {"mute_audio": True}
+                    )
+                    session['greeting_sent'] = True
+                # Otherwise, do not reply on silence
                 return
             
             logger.info(f"Transcription: '{user_input}'", extra={"session_id": session_id})
+            session['had_user_speech'] = True  # Mark that we have received meaningful speech
+            
+            # Check if we're awaiting conflict resolution
+            if session.get('awaiting_conflict_resolution'):
+                await handle_conflict_resolution_response(websocket, user_input, session)
+                return
             
             intent, entities = await process_with_gpt(user_input, session)
             
@@ -282,7 +353,8 @@ async def process_complete_audio(websocket: WebSocket, session: dict):
                 await process_meeting_scheduling(websocket, entities, session)
             else:
                 reply = entities.get("reply", "I can only help schedule meetings.")
-                await send_audio_response(websocket, reply, "clarification", session)
+                # Do not speak the clarification if we are in conflict selection context
+                await send_audio_response(websocket, reply, "clarification", session, {"mute_audio": session.get('awaiting_conflict_resolution', False)})
         except Exception as e:
             logger.error(f"CRITICAL ERROR in pipeline: {e}", extra={"session_id": session_id}, exc_info=True)
             await send_audio_response(websocket, "I ran into a problem processing that.", "error", session)
@@ -344,22 +416,155 @@ async def process_meeting_scheduling(websocket: WebSocket, entities: dict, sessi
             logger.info(f"All details gathered. Scheduling event: {completed_entities}", extra={"session_id": session_id})
             result = calendar_service.intelligent_schedule_handler(completed_entities)
             
-            # The 'event_details' is now the full event object returned by schedule_event
-            meeting_details = result.get('event_details', {})
-            
             if result.get('status') == 'scheduled':
-                # Use the title from event details, or fall back to the original title
+                # Successfully scheduled
+                meeting_details = result.get('event_details', {})
                 meeting_title = meeting_details.get('summary') or completed_entities.get('title', 'your meeting')
-                response_text = f"Perfect! I've successfully scheduled '{meeting_title}'."
+                start_time = result.get('start_formatted', result.get('start', ''))
+                response_text = f"Perfect! I've successfully scheduled '{meeting_title}' for {start_time}."
+                
+                await send_audio_response(websocket, response_text, "meeting_scheduled", session, {
+                    "event_details": meeting_details,
+                    "result": result
+                })
+                
+            elif result.get('status') == 'conflict':
+                # Handle scheduling conflict with multiple suggestions
+                from core.conversation_flow import handle_conflict_resolution
+                await handle_conflict_resolution(websocket, result, session)
+                
             else:
+                # Other errors
                 response_text = f"I couldn't schedule the meeting: {result.get('message')}."
-            
-            await send_audio_response(websocket, response_text, "meeting_result", session, {"event_details": meeting_details})
+                await send_audio_response(websocket, response_text, "meeting_error", session)
     
         except Exception as e:
             logger.error(f"💥 Meeting scheduling error: {e}", extra={"session_id": session_id}, exc_info=True)
             await send_audio_response(websocket, "Sorry, I ran into an error while trying to schedule the meeting.", "error", session)
-       
+
+async def handle_conflict_resolution_response(websocket: WebSocket, user_input: str, session: dict):
+    """
+    Handles the user's response to conflict resolution options.
+    """
+    session_id = session.get('id', 'unknown')
+    
+    try:
+        from core.conversation_flow import process_conflict_selection
+        
+        # Process the user's selection
+        selection = await process_conflict_selection(user_input, session)
+        
+        if selection is None:
+            # Invalid selection, provide more detailed guidance with improved error handling
+            # Count the number of retry attempts
+            retry_count = session.get('conflict_resolution_retry_count', 0)
+            session['conflict_resolution_retry_count'] = retry_count + 1
+            
+            # Customize message based on retry count
+            if retry_count >= 2:
+                # After multiple failures, provide more explicit guidance
+                message = "I'm still having trouble understanding your selection. Please try one of these exact phrases: 'option 1', 'option 2', 'option 3', 'one', 'two', 'three', or 'different times'. You can also try speaking more slowly and clearly."
+            else:
+                # Standard guidance for first few attempts
+                message = "I couldn't understand your selection. Please clearly say 'option 1', 'option 2', 'option 3', or you can say 'different times' if none of these work for you. You can also say just the number like 'one', 'two', or 'three'."
+            
+            await send_audio_response(
+                websocket, 
+                message,
+                "clarification",
+                session,
+                {
+                    "retry_conflict_resolution": True,
+                    "conflict_data": session.get('conflict_data'),
+                    "mute_audio": False  # Play the audio guidance to help user
+                }
+            )
+            return
+        
+        if selection == 'different':
+            # User wants different options
+            session.pop('awaiting_conflict_resolution', None)
+            session.pop('conflict_data', None)
+            # Also clear the retry counter
+            session.pop('conflict_resolution_retry_count', None)
+            await send_audio_response(
+                websocket,
+                "I understand you'd like different time options. Let me know what specific time you'd prefer, or I can suggest times for a different day.",
+                "clarification",
+                session,
+                {"mute_audio": False}  # Play audio to confirm the selection
+            )
+            return
+        
+        # User selected a valid option (1, 2, or 3)
+        # Reset the retry counter since we got a valid selection
+        session.pop('conflict_resolution_retry_count', None)
+        
+        conflict_data = session.get('conflict_data')
+        if not conflict_data:
+            await send_audio_response(
+                websocket,
+                "I'm sorry, I lost track of the scheduling options. Let's start over with scheduling your meeting.",
+                "error",
+                session
+            )
+            session.pop('awaiting_conflict_resolution', None)
+            return
+        
+        # Get the original meeting data from the conflict (preserved from the original request)
+        original_meeting_data = session.get('original_meeting_data')
+        if not original_meeting_data:
+            # Fallback to partial meeting details if original data is missing
+            original_meeting_data = {
+                'title': session.get('partial_meeting_details', {}).get('title'),
+                'date': session.get('partial_meeting_details', {}).get('date'),
+                'time': session.get('partial_meeting_details', {}).get('time'),
+                'timezone': conflict_data.get('timezone', 'UTC'),
+                'attendees': session.get('partial_meeting_details', {}).get('attendees', [])
+            }
+        
+        # Schedule using the selected option
+        calendar_service = services.get("calendar")
+        if not calendar_service:
+            raise Exception("Calendar service not available")
+        
+        result = calendar_service.schedule_suggested_slot(original_meeting_data, selection)
+        
+        # Clear conflict resolution state
+        session.pop('awaiting_conflict_resolution', None)
+        session.pop('conflict_data', None)
+        session.pop('original_meeting_data', None)
+        session.pop('partial_meeting_details', None)
+        session.pop('conflict_resolution_retry_count', None)  # Clear retry counter
+        
+        if result.get('status') == 'scheduled':
+            meeting_title = result.get('event_details', {}).get('summary', 'your meeting')
+            start_time = result.get('start_formatted', '')
+            response_text = f"Excellent! I've scheduled '{meeting_title}' for {start_time} (Option {selection} - {result.get('description', '')})."
+            
+            await send_audio_response(websocket, response_text, "meeting_scheduled", session, {
+                "event_details": result.get('event_details', {}),
+                "result": result
+            })
+        else:
+            error_message = result.get('message', 'Unknown error occurred')
+            await send_audio_response(
+                websocket,
+                f"I'm sorry, I couldn't schedule that option: {error_message}. Would you like to try a different time?",
+                "meeting_error",
+                session
+            )
+        
+    except Exception as e:
+        logger.error(f"Error handling conflict resolution response: {e}", extra={"session_id": session_id}, exc_info=True)
+        session.pop('awaiting_conflict_resolution', None)
+        session.pop('conflict_data', None)
+        await send_audio_response(
+            websocket,
+            "I encountered an error processing your selection. Let's start over with scheduling your meeting.",
+            "error",
+            session
+        )
 
 # ==============================================================================
 # 8. HTTP ENDPOINTS
@@ -433,8 +638,11 @@ async def send_audio_response(websocket: WebSocket, text: str, response_type: st
         if extra_data:
             response_data.update(extra_data)
         
+        # Allow callers to mute TTS audio by passing {'mute_audio': True}
+        mute_audio = bool(extra_data.get('mute_audio')) if isinstance(extra_data, dict) else False
+        
         text_to_voice =  _get_state_service(websocket, "text_to_voice") 
-        if text_to_voice:
+        if text_to_voice and not mute_audio:
             logger.info(f"🗣️ Synthesizing: {text}", extra={"session_id": session_id})
             try:
                 audio_response = text_to_voice.synthesize(text)
@@ -445,8 +653,10 @@ async def send_audio_response(websocket: WebSocket, text: str, response_type: st
                     logger.warning("Audio synthesis returned empty.", extra={"session_id": session_id})
             except Exception as e:
                 logger.error(f"Audio synthesis failed: {e}", extra={"session_id": session_id})
-        else:
+        elif not text_to_voice:
             logger.warning("TextToVoice service not found. Sending response without audio.", extra={"session_id": session_id})
+        else:
+            logger.info("Audio muted for this response.", extra={"session_id": session_id})
             
         await websocket.send_json(response_data)
         logger.info(f"🗣️ Sent response [{response_type}] to client.", extra={"session_id": session_id})
@@ -461,5 +671,5 @@ async def send_audio_response(websocket: WebSocket, text: str, response_type: st
 # 10. SERVER RUN
 # ==============================================================================
 if __name__ == "__main__":
-    import uvicorn
+    import uvicorn    
     uvicorn.run(app, host="localhost", port=8000)

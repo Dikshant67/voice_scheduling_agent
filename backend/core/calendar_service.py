@@ -48,14 +48,24 @@ class CalendarService:
     
         return creds
 
+    def _parse_datetime_string(self, datetime_str: str) -> datetime:
+        """
+        Parse datetime string from Google Calendar API, handling 'Z' suffix for UTC.
+        Google Calendar returns strings like '2025-10-03T08:30:00Z'
+        """
+        if datetime_str.endswith('Z'):
+            # Replace 'Z' with '+00:00' for UTC timezone
+            datetime_str = datetime_str[:-1] + '+00:00'
+        return datetime.fromisoformat(datetime_str)
+
     def has_conflict_with_buffer(self, existing_events, new_start, new_end):
         for event in existing_events:
             start = event['start'].get('dateTime')
             end = event['end'].get('dateTime')
 
             if start and end:
-                existing_start = datetime.fromisoformat(start)
-                existing_end = datetime.fromisoformat(end)
+                existing_start = self._parse_datetime_string(start)
+                existing_end = self._parse_datetime_string(end)
 
                 if existing_start.tzinfo is None or existing_end.tzinfo is None:
                     raise ValueError("Existing event times must be timezone-aware")
@@ -72,8 +82,8 @@ class CalendarService:
             end_str = event['end'].get('dateTime')
 
             if start_str and end_str:
-                existing_start = datetime.fromisoformat(start_str)
-                existing_end = datetime.fromisoformat(end_str)
+                existing_start = self._parse_datetime_string(start_str)
+                existing_end = self._parse_datetime_string(end_str)
 
                 if existing_start.tzinfo is None or existing_end.tzinfo is None:
                     raise ValueError("Existing event times must be timezone-aware")
@@ -84,6 +94,125 @@ class CalendarService:
                 current = max(current, existing_end + timedelta(minutes=self.BUFFER_MINUTES))
 
         return current
+
+    def suggest_multiple_slots(self, existing_events, desired_start, duration_minutes, num_suggestions=3):
+        """
+        Suggests multiple alternative time slots when there's a conflict.
+        Returns a list of suggested time slots with different strategies.
+        """
+        suggestions = []
+        
+        # Strategy 1: Next available slot after the desired time
+        next_slot = self.suggest_next_slot(existing_events, desired_start, duration_minutes)
+        suggestions.append({
+            'start': next_slot,
+            'end': next_slot + timedelta(minutes=duration_minutes),
+            'strategy': 'next_available',
+            'description': 'Next available time slot'
+        })
+        
+        # Strategy 2: Earlier in the same day (if possible)
+        same_day_start = desired_start.replace(hour=9, minute=0, second=0, microsecond=0)  # Start from 9 AM
+        if same_day_start < desired_start:
+            earlier_slot = self._find_available_slot_in_range(
+                existing_events, same_day_start, desired_start, duration_minutes
+            )
+            if earlier_slot and earlier_slot not in [s['start'] for s in suggestions]:
+                suggestions.append({
+                    'start': earlier_slot,
+                    'end': earlier_slot + timedelta(minutes=duration_minutes),
+                    'strategy': 'earlier_same_day',
+                    'description': 'Earlier the same day'
+                })
+        
+        # Strategy 3: Same time next day
+        next_day_slot = desired_start + timedelta(days=1)
+        next_day_end = next_day_slot + timedelta(hours=12)  # Check next 12 hours of next day
+        next_day_events = self.fetch_existing_events(next_day_slot, next_day_end)
+        
+        if not self.has_conflict_with_buffer(next_day_events, next_day_slot, next_day_slot + timedelta(minutes=duration_minutes)):
+            suggestions.append({
+                'start': next_day_slot,
+                'end': next_day_slot + timedelta(minutes=duration_minutes),
+                'strategy': 'next_day_same_time',
+                'description': 'Same time tomorrow'
+            })
+        else:
+            # Find next available slot tomorrow
+            tomorrow_available = self.suggest_next_slot(next_day_events, next_day_slot, duration_minutes)
+            if tomorrow_available not in [s['start'] for s in suggestions]:
+                suggestions.append({
+                    'start': tomorrow_available,
+                    'end': tomorrow_available + timedelta(minutes=duration_minutes),
+                    'strategy': 'next_day_available',
+                    'description': 'Next available slot tomorrow'
+                })
+        
+        # Strategy 4: Common meeting times (10 AM, 2 PM, 4 PM) on the same day
+        common_times = [10, 14, 16]  # 10 AM, 2 PM, 4 PM
+        for hour in common_times:
+            common_time_slot = desired_start.replace(hour=hour, minute=0, second=0, microsecond=0)
+            if (common_time_slot != desired_start and 
+                common_time_slot > datetime.now(desired_start.tzinfo) and
+                common_time_slot not in [s['start'] for s in suggestions]):
+                
+                if not self.has_conflict_with_buffer(existing_events, common_time_slot, common_time_slot + timedelta(minutes=duration_minutes)):
+                    suggestions.append({
+                        'start': common_time_slot,
+                        'end': common_time_slot + timedelta(minutes=duration_minutes),
+                        'strategy': 'common_time',
+                        'description': f'Popular meeting time ({common_time_slot.strftime("%I:%M %p")})'
+                    })
+                    if len(suggestions) >= num_suggestions:
+                        break
+        
+        # Remove duplicates and limit to requested number
+        unique_suggestions = []
+        seen_times = set()
+        for suggestion in suggestions:
+            time_key = suggestion['start'].strftime("%Y-%m-%d %H:%M")
+            if time_key not in seen_times:
+                seen_times.add(time_key)
+                unique_suggestions.append(suggestion)
+                if len(unique_suggestions) >= num_suggestions:
+                    break
+        
+        return unique_suggestions[:num_suggestions]
+
+    def _find_available_slot_in_range(self, existing_events, range_start, range_end, duration_minutes):
+        """
+        Finds an available slot within a specific time range.
+        """
+        current = range_start
+        
+        # Sort events by start time
+        sorted_events = sorted(existing_events, key=lambda e: e['start'].get('dateTime', ''))
+        
+        for event in sorted_events:
+            start_str = event['start'].get('dateTime')
+            end_str = event['end'].get('dateTime')
+            
+            if start_str and end_str:
+                existing_start = self._parse_datetime_string(start_str)
+                existing_end = self._parse_datetime_string(end_str)
+                
+                # Skip events outside our range
+                if existing_end <= range_start or existing_start >= range_end:
+                    continue
+                
+                # Check if there's space before this event
+                if current + timedelta(minutes=duration_minutes) <= existing_start - timedelta(minutes=self.BUFFER_MINUTES):
+                    if current + timedelta(minutes=duration_minutes) <= range_end:
+                        return current
+                
+                # Move current time to after this event
+                current = max(current, existing_end + timedelta(minutes=self.BUFFER_MINUTES))
+        
+        # Check if there's space at the end of the range
+        if current + timedelta(minutes=duration_minutes) <= range_end:
+            return current
+        
+        return None
 
     def convert_time_to_24hour(self, time_str: str) -> str:
         """
@@ -186,14 +315,30 @@ class CalendarService:
         existing_events = self.fetch_existing_events(check_start, check_end)
 
         if self.has_conflict_with_buffer(existing_events, start_dt, end_dt):
-            suggested_start = self.suggest_next_slot(existing_events, start_dt, self.DEFAULT_MEETING_DURATION)
-            suggested_end = suggested_start + timedelta(minutes=self.DEFAULT_MEETING_DURATION)
+            # Get multiple suggestions for better user experience
+            suggestions = self.suggest_multiple_slots(existing_events, start_dt, self.DEFAULT_MEETING_DURATION, num_suggestions=3)
+            
+            # Format suggestions for response
+            formatted_suggestions = []
+            for i, suggestion in enumerate(suggestions, 1):
+                formatted_suggestions.append({
+                    'option': i,
+                    'start': suggestion['start'].strftime("%Y-%m-%d %H:%M"),
+                    'end': suggestion['end'].strftime("%Y-%m-%d %H:%M"),
+                    'start_formatted': suggestion['start'].strftime("%A, %B %d at %I:%M %p"),
+                    'description': suggestion['description'],
+                    'strategy': suggestion['strategy']
+                })
 
             return {
                 'status': 'conflict',
-                'message': 'Conflicting schedule',
-                'suggested_start': suggested_start.strftime("%Y-%m-%d %H:%M"),
-                'suggested_end': suggested_end.strftime("%Y-%m-%d %H:%M"),
+                'message': 'The requested time slot conflicts with existing meetings',
+                'original_request': {
+                    'start': start_dt.strftime("%Y-%m-%d %H:%M"),
+                    'end': end_dt.strftime("%Y-%m-%d %H:%M"),
+                    'start_formatted': start_dt.strftime("%A, %B %d at %I:%M %p")
+                },
+                'suggestions': formatted_suggestions,
                 'timezone': timezone
             }
 
@@ -206,6 +351,83 @@ class CalendarService:
             'event_details': created_event,  # Include the full event details
             'link': created_event.get('htmlLink', '') if created_event else ''
         }
+
+    def schedule_suggested_slot(self, original_meeting_data, selected_option):
+        """
+        Schedules a meeting using one of the previously suggested time slots.
+        
+        Args:
+            original_meeting_data: The original meeting data with title, attendees, etc.
+            selected_option: The option number (1, 2, or 3) selected by the user
+        """
+        try:
+            title = original_meeting_data.get('title')
+            timezone = original_meeting_data.get('timezone', 'UTC')
+            attendees = original_meeting_data.get('attendees', [])
+            
+            # Get the original requested time to regenerate suggestions
+            original_date = original_meeting_data.get('date')
+            original_time = original_meeting_data.get('time')
+            
+            if not all([title, original_date, original_time]):
+                return {
+                    'status': 'error',
+                    'message': 'Missing required meeting information'
+                }
+            
+            # Recreate the original datetime to get fresh suggestions
+            time_24h = self.convert_time_to_24hour(original_time)
+            tz = pytz.timezone(timezone)
+            original_start_dt = tz.localize(datetime.strptime(f"{original_date} {time_24h}", "%Y-%m-%d %H:%M"))
+            
+            # Get existing events for conflict checking
+            check_start = original_start_dt - timedelta(hours=12)
+            check_end = original_start_dt + timedelta(days=2)
+            existing_events = self.fetch_existing_events(check_start, check_end)
+            
+            # Generate suggestions again
+            suggestions = self.suggest_multiple_slots(existing_events, original_start_dt, self.DEFAULT_MEETING_DURATION, num_suggestions=3)
+            
+            # Validate selected option
+            if selected_option < 1 or selected_option > len(suggestions):
+                return {
+                    'status': 'error',
+                    'message': f'Invalid option selected. Please choose between 1 and {len(suggestions)}'
+                }
+            
+            # Get the selected suggestion
+            selected_suggestion = suggestions[selected_option - 1]
+            start_dt = selected_suggestion['start']
+            end_dt = selected_suggestion['end']
+            
+            # Double-check for conflicts (in case calendar changed)
+            if self.has_conflict_with_buffer(existing_events, start_dt, end_dt):
+                return {
+                    'status': 'error',
+                    'message': 'The selected time slot is no longer available. Please try again.'
+                }
+            
+            # Schedule the event
+            created_event = self.schedule_event(title, start_dt, end_dt, timezone, attendees)
+            
+            return {
+                'status': 'scheduled',
+                'start': start_dt.strftime("%Y-%m-%d %H:%M"),
+                'end': end_dt.strftime("%Y-%m-%d %H:%M"),
+                'start_formatted': start_dt.strftime("%A, %B %d at %I:%M %p"),
+                'timezone': timezone,
+                'event_details': created_event,
+                'link': created_event.get('htmlLink', '') if created_event else '',
+                'selected_option': selected_option,
+                'description': selected_suggestion['description']
+            }
+            
+        except Exception as e:
+            logger.error(f"Error scheduling suggested slot: {e}", exc_info=True)
+            return {
+                'status': 'error',
+                'message': f'Failed to schedule the meeting: {str(e)}'
+            }
 
 
 

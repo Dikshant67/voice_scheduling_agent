@@ -22,13 +22,16 @@ def validate_wav_quality(wav_path: str) -> dict:
             sample_rate = wav_file.getframerate()
             duration = frames / sample_rate
             
-            # Check for common issues
-            if duration < 0.5:
+            # Check for common issues - lenient for short commands like "option 1"
+            if duration < 0.1:  # Allow even shorter clips for brief selections
                 return {'is_valid': False, 'reason': 'Audio is too short'}
-            if sample_rate != 16000:
-                return {'is_valid': False, 'reason': f'Incorrect sample rate: {sample_rate}Hz'}
             
-            return {'is_valid': True, 'duration': duration}
+            # Allow common sample rates (Azure STT can handle various rates)
+            allowed_rates = [8000, 16000, 22050, 44100, 48000]
+            if sample_rate not in allowed_rates:
+                logger.warning(f"Unusual sample rate: {sample_rate}Hz, but proceeding with STT")
+            
+            return {'is_valid': True, 'duration': duration, 'sample_rate': sample_rate}
             
     except Exception as e:
         logger.warning(f"Could not validate WAV file quality: {e}")
@@ -49,6 +52,8 @@ async def enhanced_speech_to_text(file_path: str) -> str:
         if not quality['is_valid']:
             logger.warning(f"Skipping STT due to poor audio quality: {quality['reason']}")
             return ""
+        else:
+            logger.info(f"✅ Audio quality validated: {quality.get('duration', 'N/A')}s duration, {quality.get('sample_rate', 'N/A')}Hz")
 
         # 2. Load configuration to get API keys safely
         config = Config()
@@ -58,6 +63,10 @@ async def enhanced_speech_to_text(file_path: str) -> str:
             region=config.azure_speech_region
         )
         speech_config.speech_recognition_language = "en-US"
+        
+        # Add more robust configuration
+        speech_config.set_property(speechsdk.PropertyId.SpeechServiceConnection_InitialSilenceTimeoutMs, "5000")
+        speech_config.set_property(speechsdk.PropertyId.SpeechServiceConnection_EndSilenceTimeoutMs, "1000")
         
         # 3. Use the more reliable file-based AudioConfig
         # The Azure SDK is highly optimized for this.
@@ -81,16 +90,20 @@ async def enhanced_speech_to_text(file_path: str) -> str:
     
         # 5. Process the result
         if result.reason == speechsdk.ResultReason.RecognizedSpeech:
-            logger.info(f"✅ STT Success: '{result.text}'")
-            return result.text.strip()
+            transcribed_text = result.text.strip()
+            logger.info(f"✅ STT Success: '{transcribed_text}' (confidence: {getattr(result, 'confidence', 'N/A')})")
+            return transcribed_text
         elif result.reason == speechsdk.ResultReason.NoMatch:
-            logger.warning("⚠️ No speech could be recognized from the audio.")
+            logger.warning(f"⚠️ No speech could be recognized from the audio. File: {os.path.basename(file_path)}")
+            logger.info(f"🔍 Audio details: {quality}")
+            logger.info(f"🔍 No match details: {result.no_match_details if hasattr(result, 'no_match_details') else 'N/A'}")
             return ""
         elif result.reason == speechsdk.ResultReason.Canceled:
             cancellation = result.cancellation_details
             logger.error(f"❌ Speech recognition was canceled: {cancellation.reason}")
             if cancellation.reason == speechsdk.CancellationReason.Error:
                 logger.error(f"🔍 Error details: {cancellation.error_details}")
+                logger.error(f"🔍 Audio file: {os.path.basename(file_path)}, Details: {quality}")
             return ""
             
     except Exception as e:

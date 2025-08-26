@@ -48,6 +48,35 @@ interface AudioMessage {
   is_silent?: boolean;
   session_id?: string;
   timestamp?: string;
+  // New fields for conflict resolution
+  conflict_data?: ConflictData;
+  original_request?: OriginalRequest;
+  suggestions?: ConflictSuggestion[];
+  result?: any;
+  retry_conflict_resolution?: boolean;
+}
+
+interface ConflictData {
+  status: string;
+  message: string;
+  original_request: OriginalRequest;
+  suggestions: ConflictSuggestion[];
+  timezone: string;
+}
+
+interface OriginalRequest {
+  start: string;
+  end: string;
+  start_formatted: string;
+}
+
+interface ConflictSuggestion {
+  option: number;
+  start: string;
+  end: string;
+  start_formatted: string;
+  description: string;
+  strategy: string;
 }
 
 interface AudioFeedback {
@@ -153,6 +182,13 @@ export default function EnhancedScheduleVoiceFramework() {
   const [selectedVoice, setSelectedVoice] = useState("en-IN-NeerjaNeural");
   const [selectedTimezone, setSelectedTimezone] = useState("UTC");
 
+  // Conflict resolution state
+  const [conflictData, setConflictData] = useState<ConflictData | null>(null);
+  const [isAwaitingConflictResolution, setIsAwaitingConflictResolution] =
+    useState(false);
+  const [isPlayingAudio, setIsPlayingAudio] = useState(false);
+  const audioQueueRef = useRef<string[]>([]);
+
   // --- Refs ---
   const wsRef = useRef<WebSocket | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
@@ -163,12 +199,17 @@ export default function EnhancedScheduleVoiceFramework() {
   // Audio processing constants
   const SAMPLE_RATE = 16000;
 
-  // --- Configuration Arrays (Unchanged) ---
+  // --- Configuration Arrays ---
   const voiceCommands: VoiceCommand[] = [
     { command: "Schedule meeting", description: "Create a new meeting" },
     { command: "Cancel meeting", description: "Cancel existing meeting" },
     { command: "List meetings", description: "Show all meetings" },
     { command: "Set reminder", description: "Add meeting reminder" },
+    // Conflict resolution commands
+    { command: "Option 1", description: "Select first alternative time" },
+    { command: "Option 2", description: "Select second alternative time" },
+    { command: "Option 3", description: "Select third alternative time" },
+    { command: "Different times", description: "Request different options" },
   ];
   const voices = [
     { value: "en-IN-NeerjaNeural", label: "English (India) - Female" },
@@ -212,6 +253,23 @@ export default function EnhancedScheduleVoiceFramework() {
     }
   }, []);
 
+  // --- Configuration Sending ---
+  const sendConfiguration = useCallback(() => {
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      const config = {
+        type: "config",
+        timezone: selectedTimezone,
+        voice: selectedVoice,
+        session_id: sessionId,
+      };
+      wsRef.current.send(JSON.stringify(config));
+      console.log("📤 Sent configuration:", config);
+      addMessage(
+        `⚙️ Configuration sent: ${selectedTimezone}, ${selectedVoice}`
+      );
+    }
+  }, [selectedTimezone, selectedVoice, sessionId]);
+
   // --- WebSocket Logic (partially modified) ---
   const connectWebSocket = useCallback(() => {
     try {
@@ -231,6 +289,9 @@ export default function EnhancedScheduleVoiceFramework() {
         setConnectionStatus("Connected");
         addMessage("🟢 Connected to enhanced voice assistant");
         toast.success("Connected to voice assistant");
+
+        // Send configuration to backend
+        sendConfiguration();
       };
 
       wsRef.current.onmessage = async (event) => {
@@ -316,10 +377,72 @@ export default function EnhancedScheduleVoiceFramework() {
       case "clarification":
         setIsProcessing(false); // Stop the processing spinner
         addMessage(`🤔 Assistant asks: "${data.message}"`);
+
+        // Check if this is a retry for conflict resolution
+        if (data.retry_conflict_resolution) {
+          // Keep the conflict resolution UI active
+          setIsAwaitingConflictResolution(true);
+          if (data.conflict_data) {
+            setConflictData(data.conflict_data);
+          }
+          // Show a more specific toast for conflict resolution retries
+          toast.warning("Please try saying your option choice again");
+        } else {
+          // Regular clarification
+          toast.info("Assistant needs more information...");
+        }
+
         if (data.audio) {
           await playAudioFromHex(data.audio); // Play the audio of the question
         }
-        toast.info("Assistant needs more information...");
+        break;
+      case "conflict_resolution":
+        setIsProcessing(false);
+        if (data.conflict_data) {
+          setConflictData(data.conflict_data);
+          setIsAwaitingConflictResolution(true);
+          // Clear any previous transcription to avoid confusion
+          setTranscription("");
+          addMessage(`⚠️ Scheduling conflict detected`);
+          addMessage(
+            `📅 Original request: ${data.conflict_data.original_request.start_formatted}`
+          );
+          data.conflict_data.suggestions.forEach((suggestion, index) => {
+            addMessage(
+              `   Option ${suggestion.option}: ${suggestion.start_formatted} - ${suggestion.description}`
+            );
+          });
+          // Show a toast notification before playing audio
+          toast.warning("Scheduling conflict - please listen to options");
+          // Play the audio with options
+          if (data.audio) await playAudioFromHex(data.audio);
+          // The visual indicator for waiting for voice input will be shown
+          // after audio playback completes in the playAudioFromHex function
+        }
+        break;
+      case "meeting_scheduled":
+        setIsProcessing(false);
+        setIsAwaitingConflictResolution(false);
+        setConflictData(null);
+        addMessage(data.message || "✅ Meeting scheduled successfully");
+        if (data.audio) await playAudioFromHex(data.audio);
+        if (data.event_details) {
+          displayMeetingDetails(data.event_details);
+          await fetchAvailability();
+        }
+        toast.success("Meeting scheduled successfully");
+        break;
+      case "meeting_error":
+        setIsProcessing(false);
+        setIsAwaitingConflictResolution(false);
+        setConflictData(null);
+        addMessage(`❌ ${data.message}`);
+        if (data.audio) await playAudioFromHex(data.audio);
+        toast.error(data.message || "Failed to schedule meeting");
+        break;
+      case "config_received":
+        addMessage(`✅ ${data.message}`);
+        toast.success("Configuration updated successfully");
         break;
       default:
         console.log("🤷 Unknown message type:", data.type);
@@ -327,25 +450,102 @@ export default function EnhancedScheduleVoiceFramework() {
     }
   };
 
-  // --- Audio Playback (Unchanged) ---
+  const sendClientText = (text: string) => {
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ type: "client_text", text }));
+      addMessage(`📤 Sent: ${text}`);
+    } else {
+      toast.error("Not connected");
+    }
+  };
+
+  // --- Audio Playback (Enhanced for Conflict Resolution) ---
   const playAudioFromHex = async (hexAudio: string): Promise<void> => {
     try {
+      // Add to queue if audio is already playing
+      if (isPlayingAudio) {
+        console.log("🔇 Audio already playing, adding to queue");
+        audioQueueRef.current.push(hexAudio);
+        return;
+      }
+
+      console.log("🔊 Starting audio playback...");
+      setIsPlayingAudio(true);
+
+      // Clear any previous transcription when starting new audio
+      // This helps prevent confusion between system audio and user speech
+      if (isAwaitingConflictResolution) {
+        setTranscription("");
+      }
+
       const audioData = new Uint8Array(
         hexAudio.match(/.{2}/g)?.map((byte) => parseInt(byte, 16)) || []
       );
-      if (audioData.length === 0) return;
+      if (audioData.length === 0) {
+        console.log("🔇 No audio data to play");
+        setIsPlayingAudio(false);
+        processAudioQueue();
+        return;
+      }
+
       const tempAudioContext = new (window.AudioContext ||
         (window as any).webkitAudioContext)();
+
+      // Resume audio context if it's suspended (browser autoplay policy)
+      if (tempAudioContext.state === "suspended") {
+        await tempAudioContext.resume();
+      }
+
       const audioBuffer = await tempAudioContext.decodeAudioData(
         audioData.buffer
       );
       const source = tempAudioContext.createBufferSource();
       source.buffer = audioBuffer;
       source.connect(tempAudioContext.destination);
+
+      // Set up cleanup when audio ends
+      source.onended = () => {
+        console.log("🔊 Audio playback finished");
+        tempAudioContext.close();
+        setIsPlayingAudio(false);
+
+        // Add a small delay before processing the next audio in the queue
+        // This prevents audio overlap and gives users time to process what they heard
+        setTimeout(() => {
+          processAudioQueue();
+
+          // If we're in conflict resolution mode, show a visual indicator that
+          // the system is waiting for voice input after audio finishes
+          if (isAwaitingConflictResolution) {
+            setTranscription(
+              "Waiting for your choice... (say 'Option 1', 'Option 2', etc.)"
+            );
+            toast.info("Please select an option by voice");
+            
+            // Automatically start recording to capture the user's option selection
+            // Only start if we're not already recording and there are no more audio in the queue
+            if (!isRecording && audioQueueRef.current.length === 0) {
+              console.log("🎤 Auto-starting recording for conflict resolution response");
+              setTimeout(() => startRecording(), 1000); // Start recording after a 1-second delay
+            }
+          }
+        }, 500); // 500ms delay
+      };
+
       source.start(0);
-      source.onended = () => tempAudioContext.close();
     } catch (error) {
       console.error("🔊 Audio playback failed:", error);
+      setIsPlayingAudio(false);
+      processAudioQueue();
+    }
+  };
+
+  const processAudioQueue = () => {
+    if (audioQueueRef.current.length > 0) {
+      const nextAudio = audioQueueRef.current.shift();
+      if (nextAudio) {
+        setTimeout(() => playAudioFromHex(nextAudio), 100); // Small delay between audio
+      }
     }
   };
 
@@ -620,6 +820,13 @@ export default function EnhancedScheduleVoiceFramework() {
     console.log("[STATE] isRecording changed to:", isRecording);
   }, [isRecording]);
 
+  // Effect 4: Send configuration when timezone or voice changes
+  useEffect(() => {
+    if (isConnected) {
+      sendConfiguration();
+    }
+  }, [selectedTimezone, selectedVoice, isConnected, sendConfiguration]);
+
   // --- JSX (UI) ---
   return (
     <div className="min-h-screen bg-gradient-to-br from-slate-50 via-blue-50 to-indigo-50">
@@ -791,6 +998,170 @@ export default function EnhancedScheduleVoiceFramework() {
                 </div>
               </CardContent>
             </Card>
+
+            {/* Conflict Resolution Panel - Voice + Click Support */}
+            {isAwaitingConflictResolution && conflictData && (
+              <Card className="border-0 shadow-xl bg-gradient-to-r from-orange-50 to-red-50 backdrop-blur-sm border-orange-200">
+                <CardHeader>
+                  <CardTitle className="text-lg font-semibold text-orange-800 flex items-center gap-2">
+                    <XCircle className="w-5 h-5" /> Scheduling Conflict Detected
+                  </CardTitle>
+                  <p className="text-orange-700">
+                    Your requested time conflicts with existing meetings.
+                  </p>
+                </CardHeader>
+                <CardContent className="space-y-4">
+                  {/* Audio playback status indicator */}
+                  {isPlayingAudio ? (
+                    <div className="p-3 bg-blue-100 rounded-lg border border-blue-200 flex items-center justify-center">
+                      <div className="flex items-center gap-2">
+                        <Volume2 className="w-5 h-5 text-blue-600 animate-pulse" />
+                        <p className="text-blue-700 font-medium">
+                          Playing audio options... Please listen
+                        </p>
+                      </div>
+                    </div>
+                  ) : isRecording ? (
+                    <div className="p-4 bg-red-100 rounded-lg border-2 border-red-300 flex items-center justify-center">
+                      <div className="flex items-center gap-3">
+                        <div className="relative">
+                          <Mic className="w-6 h-6 text-red-600" />
+                          <div className="absolute -inset-1 border border-red-400 rounded-full animate-ping"></div>
+                        </div>
+                        <div>
+                          <p className="text-red-700 font-medium">
+                            Listening for your selection...
+                          </p>
+                          <p className="text-red-600 text-sm">
+                            Say "Option 1", "Option 2", "Option 3", or "Different times"
+                          </p>
+                        </div>
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="p-3 bg-green-100 rounded-lg border border-green-200 flex items-center justify-center">
+                      <div className="flex items-center gap-2">
+                        <Mic className="w-5 h-5 text-green-600 animate-pulse" />
+                        <p className="text-green-700 font-medium">
+                          Please speak your choice: "Option 1", "Option 2", or
+                          "Option 3"
+                        </p>
+                      </div>
+                    </div>
+                  )}
+
+                  <div className="p-3 bg-orange-100 rounded-lg border border-orange-200">
+                    <p className="text-sm font-medium text-orange-800">
+                      Original Request:
+                    </p>
+                    <p className="text-orange-700">
+                      {conflictData.original_request.start_formatted}
+                    </p>
+                  </div>
+
+                  <div className="space-y-3">
+                    <p className="text-sm font-medium text-orange-800">
+                      Available Options:
+                    </p>
+                    {conflictData.suggestions.map((suggestion) => (
+                      <button
+                        key={suggestion.option}
+                        onClick={() =>
+                          sendClientText(`option ${suggestion.option}`)
+                        }
+                        className={`w-full text-left p-4 rounded-lg border transition hover:brightness-95 ${
+                          suggestion.option === 1
+                            ? "bg-blue-50 border-blue-200"
+                            : suggestion.option === 2
+                            ? "bg-green-50 border-green-200"
+                            : "bg-purple-50 border-purple-200"
+                        }`}
+                      >
+                        <div className="flex items-start">
+                          <div className="flex-shrink-0 mr-3">
+                            <div
+                              className={`w-8 h-8 rounded-full flex items-center justify-center font-bold text-white ${
+                                suggestion.option === 1
+                                  ? "bg-blue-500"
+                                  : suggestion.option === 2
+                                  ? "bg-green-500"
+                                  : "bg-purple-500"
+                              }`}
+                            >
+                              {suggestion.option}
+                            </div>
+                          </div>
+                          <div className="flex-1">
+                            <div className="flex items-center gap-2 mb-1">
+                              <Badge
+                                variant="outline"
+                                className="bg-orange-100 text-orange-800 border-orange-300"
+                              >
+                                Option {suggestion.option}
+                              </Badge>
+                              <span className="text-xs text-slate-500 uppercase tracking-wide">
+                                {suggestion.strategy.replace("_", " ")}
+                              </span>
+                            </div>
+                            <p className="font-medium text-slate-800 mb-1">
+                              {suggestion.start_formatted}
+                            </p>
+                            <p className="text-sm text-slate-600">
+                              {suggestion.description}
+                            </p>
+                          </div>
+                        </div>
+                      </button>
+                    ))}
+
+                    <div className="flex gap-3 pt-2">
+                      <Button
+                        variant="outline"
+                        onClick={() => sendClientText("different times")}
+                      >
+                        Suggest different times
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        onClick={() => sendClientText("cancel")}
+                      >
+                        Cancel
+                      </Button>
+                    </div>
+                  </div>
+
+                  <div className="bg-blue-50 border border-blue-200 rounded-lg p-4">
+                    <div className="flex items-center gap-2 mb-2">
+                      <Mic className="w-4 h-4 text-blue-600" />
+                      <p className="text-sm font-medium text-blue-800">
+                        Voice Commands:
+                      </p>
+                    </div>
+                    <div className="text-sm text-blue-700 space-y-1">
+                      <p>
+                        • Say <strong>"Option 1"</strong>,{" "}
+                        <strong>"Option 2"</strong>, or{" "}
+                        <strong>"Option 3"</strong> to select
+                      </p>
+                      <p>
+                        • Say <strong>"Different times"</strong> to get new
+                        options
+                      </p>
+                      <p>
+                        • Say <strong>"Cancel"</strong> to cancel scheduling
+                      </p>
+                    </div>
+                  </div>
+
+                  <div className="text-center">
+                    <div className="inline-flex items-center gap-2 px-4 py-2 bg-orange-100 text-orange-800 rounded-full text-sm font-medium">
+                      <div className="w-2 h-2 bg-orange-500 rounded-full animate-pulse"></div>
+                      Waiting for your voice command...
+                    </div>
+                  </div>
+                </CardContent>
+              </Card>
+            )}
 
             <Card className="border-0 shadow-lg bg-white/70 backdrop-blur-sm">
               <CardHeader>
