@@ -115,6 +115,12 @@ python -m unittest discover tests
 - **Configuration**: backend/config/
 - **Data Storage**: backend/data/
 
+### KEYS 
+AZURE_SPEECH_KEY
+AZURE_SPEECH_REGION
+AZURE_OPENAI_API_KEY
+AZURE_OPENAI_ENDPOINT
+AZURE_OPENAI_DEPLOYMENT
+AZURE_OPENAI_API_VERSION
 ```
-
 ```
