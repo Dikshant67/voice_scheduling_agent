@@ -8,33 +8,40 @@ def is_valid_date(date_str: str) -> bool:
     except ValueError:
         return False
 
+
 def is_valid_time(time_str: str) -> bool:
     """
-    Validates time string in multiple formats:
-    - 24-hour format: "14:30", "09:00"
-    - 12-hour format with AM/PM: "2:30 PM", "09:00 AM", "05:00 AM"
+    Validates time string in multiple formats, ensuring robustness.
+    - "17:00", "5:00 PM", "5:00PM", "5 PM", "5PM", "17"
     """
-    if not time_str:
+    # Ensure the input is a non-empty string
+    if not isinstance(time_str, str) or not time_str:
         return False
     
-    time_str = time_str.strip()
+    # Standardize input: remove whitespace and convert to uppercase for AM/PM consistency
+    time_str = time_str.strip().upper()
     
-    # List of supported time formats
+    # A more comprehensive list of supported time formats
     time_formats = [
-        "%H:%M",        # 24-hour format: "14:30"
-        "%I:%M %p",     # 12-hour format with AM/PM: "2:30 PM"
-        "%I:%M%p",      # 12-hour format without space: "2:30PM"
+        "%H:%M",      # 24-hour format: "17:00"
+        "%I:%M %p",   # 12-hour format with space: "5:00 PM"
+        "%I:%M%p",    # 12-hour format without space: "5:00PM"
+        "%I %p",      # 12-hour format, hour only: "5 PM"
+        "%I%p",       # 12-hour format, hour only, no space: "5PM"
+        "%H"          # 24-hour format, hour only: "17"
     ]
     
     for time_format in time_formats:
         try:
+            # If strptime can parse it with a given format, the time is valid
             datetime.strptime(time_str, time_format)
             return True
         except ValueError:
+            # If it fails, just try the next format in the list
             continue
-    
+            
+    # If the loop finishes without any format matching, the time is invalid
     return False
-
 def validate_meeting_details(entities: dict):
     required = ["title", "date", "time", "timezone"]
     for field in required:

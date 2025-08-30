@@ -58,10 +58,19 @@ class GPTAgent:
                 5.  If the user says "with John" and the title is empty, set the title to "Meeting with John".
                 6.  If the user corrects a detail (e.g., "no, make it 5 PM"), update the existing detail.
                 7.  Your final output must be a single JSON object with the most up-to-date entities.
-    
+
+                # Intent Mapping
+                - If user wants to book/create: intent='schedule_meeting'.
+                - If user wants to cancel/delete: intent='cancel_meeting'.
+                - If user wants to move/change time/date: intent='reschedule_meeting'.
+                - If user asks to list meetings for a specific day (e.g., "get the meetings on this day"), infer the date from context or require 'date', and set intent='get_meetings_day'.
+
                 # JSON Output Format
-                - intent: 'schedule_meeting' or 'other'.
-                - entities: A JSON object with keys like 'title', 'date', 'time', 'attendees'.
+                - intent: one of 'schedule_meeting' | 'cancel_meeting' | 'reschedule_meeting' | 'get_meetings_day' | 'other'.
+                - entities:
+                  - For cancellation: {"title?","date?","time?","timezone?"} (allow by title only, or by date+time)
+                  - For reschedule: {"title?","date?","time?","timezone?","new_date","new_time"}
+                  - For day listing: {"date","timezone?"}
                 """
     
                 response = self.client.chat.completions.create(

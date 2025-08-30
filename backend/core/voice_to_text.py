@@ -8,6 +8,8 @@ import azure.cognitiveservices.speech as speechsdk
 import numpy as np
 from config.config import Config
 
+
+
 # Get a logger instance for this module
 logger = logging.getLogger(__name__)
 
@@ -36,6 +38,48 @@ def validate_wav_quality(wav_path: str) -> dict:
     except Exception as e:
         logger.warning(f"Could not validate WAV file quality: {e}")
         return {'is_valid': False, 'reason': f'File validation failed: {str(e)}'}
+
+
+async def stt_from_pcm(pcm_bytes: bytes, sample_rate: int = 16000) -> str:
+    try:
+        if not pcm_bytes:
+            return ""
+        config = Config()
+        speech_config = speechsdk.SpeechConfig(
+            subscription=config.azure_speech_key,
+            region=config.azure_speech_region
+        )
+        speech_config.speech_recognition_language = "en-US"
+        # Faster endpointing
+        speech_config.set_property(
+            speechsdk.PropertyId.SpeechServiceConnection_InitialSilenceTimeoutMs, "2000"
+        )
+        speech_config.set_property(
+            speechsdk.PropertyId.SpeechServiceConnection_EndSilenceTimeoutMs, "500"
+        )
+
+        fmt = speechsdk.audio.AudioStreamFormat(
+            samples_per_second=sample_rate,
+            bits_per_sample=16,
+            channels=1
+        )
+        push = speechsdk.audio.PushAudioInputStream(fmt)
+        push.write(pcm_bytes)
+        push.close()
+
+        audio_cfg = speechsdk.audio.AudioConfig(stream=push)
+        recognizer = speechsdk.SpeechRecognizer(speech_config=speech_config, audio_config=audio_cfg)
+
+        future = recognizer.recognize_once_async()
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(None, future.get)
+
+        if result.reason == speechsdk.ResultReason.RecognizedSpeech:
+            return result.text.strip()
+        return ""
+    except Exception as e:
+        logger.error(f"STT memory error: {e}", exc_info=True)
+        return ""
 
 async def enhanced_speech_to_text(file_path: str) -> str:
     """

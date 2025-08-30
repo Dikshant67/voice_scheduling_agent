@@ -26,7 +26,7 @@ from core.conversation_flow import fill_missing_fields_async
 from core.run_gpt_agent import GPTAgent
 from core.smart_audio_processor import SmartAudioProcessor
 from core.text_to_voice import TextToVoice
-from core.voice_to_text import enhanced_speech_to_text
+from core.voice_to_text import enhanced_speech_to_text,stt_from_pcm
 # ==============================================================================
 # 2. LOGGING SETUP
 # ==============================================================================
@@ -286,17 +286,17 @@ async def process_complete_audio(websocket: WebSocket, session: dict):
         complete_audio = processor.get_complete_audio()
         audio_duration = len(complete_audio) / (SAMPLE_RATE * BYTES_PER_SAMPLE)
         logger.info(f"Processing audio segment of {audio_duration:.2f}s", extra={"session_id": session_id})
-
+ 
         # Allow very short replies (e.g., "option 1") during conflict selection
         if audio_duration < 0.5 and not session.get('awaiting_conflict_resolution'):
             # If no meaningful speech has occurred since the start, send a one-time helpful prompt without audio
             if not session.get('had_user_speech') and not session.get('greeting_sent'):
                 await send_audio_response(
                     websocket,
-                    "I can help you manage your meeting. For example, say 'Schedule a meeting tomorrow at 10 AM'.",
+                    "I can help you manage your meetings. ",
                     "prompt",
                     session,
-                    {"mute_audio": True}
+                    {"mute_audio": False}
                 )
                 session['greeting_sent'] = True
             # Otherwise, remain silent on very short audio
@@ -305,8 +305,14 @@ async def process_complete_audio(websocket: WebSocket, session: dict):
         temp_file = None
         try:
             await websocket.send_json({"type": "processing_started", "message": "🔄 Processing...", "session_id": session_id})
+            
             temp_file = save_pcm_as_wav(bytearray(complete_audio))
-            if not temp_file: raise Exception("Failed to save audio to WAV file.")
+            # user_input = await stt_from_pcm(bytes(complete_audio), SAMPLE_RATE)
+            # if not user_input :
+            #     temp_file=save_pcm_as_wav(bytearray(complete_audio))
+                
+            if not temp_file: 
+                    raise Exception("Failed to save audio to WAV file.")
 
             user_input = await enhanced_speech_to_text(temp_file)
             logger.info(f"Raw transcription result: '{user_input}' (type: {type(user_input)})", extra={"session_id": session_id})
@@ -351,9 +357,17 @@ async def process_complete_audio(websocket: WebSocket, session: dict):
             if intent == "schedule_meeting":
                 entities['timezone'] = session.get('timezone', 'UTC')
                 await process_meeting_scheduling(websocket, entities, session)
+            elif intent == "cancel_meeting":
+                entities['timezone'] = session.get('timezone', 'UTC')
+                await process_meeting_cancellation(websocket, entities, session)
+            elif intent == "reschedule_meeting":
+                entities['timezone'] = session.get('timezone', 'UTC')
+                await process_meeting_reschedule(websocket, entities, session)
+            elif intent == "get_meetings_day":
+                entities['timezone'] = session.get('timezone', 'UTC')
+                await process_meetings_for_day(websocket, entities, session)
             else:
-                reply = entities.get("reply", "I can only help schedule meetings.")
-                # Do not speak the clarification if we are in conflict selection context
+                reply = entities.get("reply", "I can help you schedule, cancel, reschedule, or list the day's meetings.")
                 await send_audio_response(websocket, reply, "clarification", session, {"mute_audio": session.get('awaiting_conflict_resolution', False)})
         except Exception as e:
             logger.error(f"CRITICAL ERROR in pipeline: {e}", extra={"session_id": session_id}, exc_info=True)
@@ -382,6 +396,8 @@ async def process_with_gpt(user_input: str, session: dict) -> tuple:
         intent, new_entities = gpt_agent.process_input(user_input, context)
         
         # Combine old and new entities
+        logging.error(f"DEBUG: new_entities={new_entities} (type={type(new_entities)})")
+
         final_entities = {**partial_details, **new_entities}
         
         session['interaction_history'].append({'input': user_input, 'intent': intent})
@@ -415,13 +431,17 @@ async def process_meeting_scheduling(websocket: WebSocket, entities: dict, sessi
             # If we have all the details, proceed to schedule.
             logger.info(f"All details gathered. Scheduling event: {completed_entities}", extra={"session_id": session_id})
             result = calendar_service.intelligent_schedule_handler(completed_entities)
+            flag=1
+            
             
             if result.get('status') == 'scheduled':
                 # Successfully scheduled
                 meeting_details = result.get('event_details', {})
                 meeting_title = meeting_details.get('summary') or completed_entities.get('title', 'your meeting')
                 start_time = result.get('start_formatted', result.get('start', ''))
-                response_text = f"Perfect! I've successfully scheduled '{meeting_title}' for {start_time}."
+                
+                response_text = f"Perfect! I've successfully scheduled '{meeting_title}' for {start_time}." if flag == 1 else f"Great! I've successfully scheduled '{meeting_title}' for {start_time}."
+                flag += 1                                                                                                                                                                               
                 
                 await send_audio_response(websocket, response_text, "meeting_scheduled", session, {
                     "event_details": meeting_details,
@@ -441,6 +461,86 @@ async def process_meeting_scheduling(websocket: WebSocket, entities: dict, sessi
         except Exception as e:
             logger.error(f"💥 Meeting scheduling error: {e}", extra={"session_id": session_id}, exc_info=True)
             await send_audio_response(websocket, "Sorry, I ran into an error while trying to schedule the meeting.", "error", session)
+
+async def process_meeting_cancellation(websocket: WebSocket, entities: dict, session: dict):
+        session_id = session.get('id', 'unknown')
+        calendar_service = services.get("calendar")
+        if not calendar_service:
+            await send_audio_response(websocket, "Calendar service is unavailable.", "error", session)
+            return
+        try:
+            title = entities.get('title')
+            date = entities.get('date')
+            time = entities.get('time')
+            timezone = entities.get('timezone', session.get('timezone', 'UTC'))
+            # Robust policy: allow cancel by title only OR by date(+time)
+            if not (title or date):
+                await send_audio_response(websocket, "Please provide either the meeting title or the date (and optional time) to cancel.", "clarification", session)
+                return
+            result = calendar_service.cancel_event(title, date, time, timezone)
+            if result.get('status') == 'cancelled':
+                meeting_title = result['event'].get('summary', title or 'the meeting')
+                start_iso = (result['event'].get('start') or {}).get('dateTime')
+                when = start_iso or (date or '')
+                await send_audio_response(websocket, f"Cancelled '{meeting_title}' {('scheduled on ' + when) if when else ''}.", "meeting_cancelled", session)
+            elif result.get('status') == 'not_found':
+                await send_audio_response(websocket, "I couldn't find a matching meeting to cancel.", "meeting_error", session)
+            else:
+                await send_audio_response(websocket, f"Couldn't cancel the meeting: {result.get('message')}", "meeting_error", session)
+        except Exception as e:
+            logger.error(f"Cancel error: {e}", extra={"session_id": session_id}, exc_info=True)
+            await send_audio_response(websocket, "Sorry, I couldn't cancel that meeting.", "error", session)
+
+async def process_meeting_reschedule(websocket: WebSocket, entities: dict, session: dict):
+        session_id = session.get('id', 'unknown')
+        calendar_service = services.get("calendar")
+        if not calendar_service:
+            await send_audio_response(websocket, "Calendar service is unavailable.", "error", session)
+            return
+        try:
+            title = entities.get('title')
+            date = entities.get('date')
+            time = entities.get('time')
+            timezone = entities.get('timezone', session.get('timezone', 'UTC'))
+            new_date = entities.get('new_date')
+            new_time = entities.get('new_time')
+            # Robust policy: allow reschedule by title only OR by date(+time), but require new_date and new_time
+            if not (title or date) or not (new_date and new_time):
+                await send_audio_response(websocket, "Please provide either the original meeting title or date (and optional time), plus the new date and time.", "clarification", session)
+                return
+            result = calendar_service.reschedule_event(title, date, time, timezone, new_date, new_time)
+            status = result.get('status')
+            if status == 'rescheduled':
+                new_ev = result.get('event', {})
+                start_iso = (new_ev.get('start') or {}).get('dateTime')
+                when = start_iso or f"{new_date} {new_time}"
+                await send_audio_response(websocket, f"Rescheduled '{title or 'your meeting'}' to {when}.", "meeting_rescheduled", session)
+            elif status == 'not_found':
+                await send_audio_response(websocket, "I couldn't find a matching meeting to reschedule.", "meeting_error", session)
+            else:
+                await send_audio_response(websocket, f"Couldn't reschedule: {result.get('message')}", "meeting_error", session)
+        except Exception as e:
+            logger.error(f"Reschedule error: {e}", extra={"session_id": session_id}, exc_info=True)
+            await send_audio_response(websocket, "Sorry, I couldn't reschedule that meeting.", "error", session)
+
+async def process_meetings_for_day(websocket: WebSocket, entities: dict, session: dict):
+    session_id = session.get('id', 'unknown')
+    calendar_service = services.get("calendar")
+    if not calendar_service:
+        await send_audio_response(websocket, "Calendar service is unavailable.", "error", session)
+        return
+    try:
+        date = entities.get('date')
+        timezone = entities.get('timezone', session.get('timezone', 'UTC'))
+        if not date:
+            await send_audio_response(websocket, "Please provide the date (YYYY-MM-DD) to list meetings for.", "clarification", session)
+            return
+        meetings = calendar_service.list_meetings_for_day(date, timezone)
+        speech = calendar_service.format_meetings_day_speech(meetings, timezone)
+        await send_audio_response(websocket, speech, "meetings_day", session, {"items": meetings})
+    except Exception as e:
+        logger.error(f"List day meetings error: {e}", extra={"session_id": session_id}, exc_info=True)
+        await send_audio_response(websocket, "Sorry, I couldn't get the meetings for that day.", "error", session)
 
 async def handle_conflict_resolution_response(websocket: WebSocket, user_input: str, session: dict):
     """

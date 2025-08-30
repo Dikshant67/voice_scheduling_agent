@@ -350,7 +350,7 @@ export default function EnhancedScheduleVoiceFramework() {
         setIsProcessing(true);
         addMessage("🔄 Processing your speech...");
         break;
-      case "meeting_result":
+      case "meeting_scheduled":
         setIsProcessing(false);
         addMessage(data.message || "✅ Meeting processed");
         if (data.audio) await playAudioFromHex(data.audio);
@@ -521,11 +521,13 @@ export default function EnhancedScheduleVoiceFramework() {
               "Waiting for your choice... (say 'Option 1', 'Option 2', etc.)"
             );
             toast.info("Please select an option by voice");
-            
+
             // Automatically start recording to capture the user's option selection
             // Only start if we're not already recording and there are no more audio in the queue
             if (!isRecording && audioQueueRef.current.length === 0) {
-              console.log("🎤 Auto-starting recording for conflict resolution response");
+              console.log(
+                "🎤 Auto-starting recording for conflict resolution response"
+              );
               setTimeout(() => startRecording(), 1000); // Start recording after a 1-second delay
             }
           }
@@ -1033,7 +1035,8 @@ export default function EnhancedScheduleVoiceFramework() {
                             Listening for your selection...
                           </p>
                           <p className="text-red-600 text-sm">
-                            Say "Option 1", "Option 2", "Option 3", or "Different times"
+                            Say "Option 1", "Option 2", "Option 3", or
+                            "Different times"
                           </p>
                         </div>
                       </div>

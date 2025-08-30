@@ -1,10 +1,13 @@
 # In core/conversation_flow.py
-
 from typing import Optional
 from core.text_to_voice import TextToVoice
 from fastapi import WebSocket
 from core.validation import is_valid_date, is_valid_time
+import re
+import logging
 
+# Get the logger instance
+logger = logging.getLogger(__name__)
 REQUIRED_FIELDS = ['title', 'date', 'time']
 
 async def handle_conflict_resolution(websocket, conflict_data, session):
@@ -46,53 +49,58 @@ async def handle_conflict_resolution(websocket, conflict_data, session):
         
     })
 
-async def process_conflict_selection(user_input: str, session: dict):
+async def process_conflict_selection(user_input: str, session: dict) -> [int, str, None]:
     """
-    Processes the user's selection from conflict resolution options.
-    Returns the selected option number or None if invalid.
+    Processes the user's selection from conflict resolution options with improved accuracy.
+    Returns the selected option number, 'different', or None if invalid.
     """
     user_input_lower = user_input.lower().strip()
     
-    # Extract option number from various formats
+    # --- FIX 1: Check for rejection FIRST using word boundaries ---
+    # Using r'\bno\b' ensures 'no' doesn't match inside 'number' or 'know'.
+    rejection_patterns = [
+        'different', 'other', 'another', 'none', 'neither', r'\bno\b', 'cancel'
+    ]
+    for pattern in rejection_patterns:
+        if re.search(pattern, user_input_lower):
+            return 'different'
+
+    # --- If not a rejection, now check for a valid selection ---
+    
+    # A. Check for selections with digits (e.g., "option 1")
     option_patterns = [
-        r'option\s*(\d+)',
-        r'choice\s*(\d+)',
-        r'number\s*(\d+)',
-        r'^(\d+)$',  # Just a number
-        r'the\s*(\d+)',
-        r'pick\s*(\d+)',
-        r'select\s*(\d+)'
+        r'(?:option|choice|number|pick|select)\s*(\d+)',
+        r'^(\d+)$' # A raw number like "1"
     ]
     
-    import re
     for pattern in option_patterns:
         match = re.search(pattern, user_input_lower)
         if match:
             try:
                 option_num = int(match.group(1))
-                if 1 <= option_num <= 3:  # Valid option range
+                # Assuming max 3 suggestions, adjust if needed
+                # if 1 <= option_num <= 3: 
+                #     return option_num
+                suggestions = session.get('conflict_data', {}).get('suggestions', [])
+                if 1 <= option_num <= len(suggestions):
                     return option_num
-            except ValueError:
+            except (ValueError, IndexError):
                 continue
     
-    # Handle text-based selections
+    # B. Check for selections with words (e.g., "the first one")
+    # Using word boundaries (\b) prevents "one" from matching inside "none"
     text_mappings = {
-        'first': 1, 'one': 1, '1st': 1,
-        'second': 2, 'two': 2, '2nd': 2,
-        'third': 3, 'three': 3, '3rd': 3
+        r'\b(?:first|one|1st)\b': 1,
+        r'\b(?:second|two|2nd)\b': 2,
+        r'\b(?:third|three|3rd)\b': 3
     }
     
-    for text, num in text_mappings.items():
-        if text in user_input_lower:
+    for pattern, num in text_mappings.items():
+        if re.search(pattern, user_input_lower):
             return num
     
-    # Handle rejection/request for different options
-    rejection_keywords = ['different', 'other', 'another', 'none', 'neither', 'no', 'cancel']
-    if any(keyword in user_input_lower for keyword in rejection_keywords):
-        return 'different'
-    
+    # If no valid selection or rejection was found, return None
     return None
-
 async def send_clarification_request(field: str, websocket: WebSocket, text_to_voice: TextToVoice, session: dict):
     """Sends a vocal request for a missing field."""
     prompts = {
@@ -113,7 +121,23 @@ async def fill_missing_fields_async(entities: dict, text_to_voice: TextToVoice, 
     """
     from main import send_audio_response
     partial_details = session.get('partial_meeting_details', {})
-    combined_details = {**partial_details, **entities}
+    
+        # --- START OF FIX ---
+    # Normalize incoming entities to handle singular/plural variations from GPT
+    normalized_entities = {}
+    for key, value in entities.items():
+        # Use a precise 'in' check for date/dates
+        if key in ('date', 'dates'):
+            normalized_entities['date'] = value[0] if isinstance(value, list) and value else value
+        # Use a precise 'in' check for time/times, which will NOT match 'timezone'
+        elif key in ('time', 'times'):
+            normalized_entities['time'] = value[0] if isinstance(value, list) and value else value
+        else:
+            normalized_entities[key] = value
+    # --- END OF THE CORRECTED FIX ---
+
+    # Now, use the clean, normalized data for the rest of the function
+    combined_details = {**partial_details, **normalized_entities}
 
     # First, check for the basic required fields
     for field in REQUIRED_FIELDS:
@@ -122,13 +146,14 @@ async def fill_missing_fields_async(entities: dict, text_to_voice: TextToVoice, 
         is_invalid = False
         if field == 'date' and (not value or not is_valid_date(value)): is_invalid = True
         elif field == 'time' and (not value or not is_valid_time(value)): is_invalid = True
-        elif not value: is_invalid = True
         
-        if is_invalid:
-            session['partial_meeting_details'] = combined_details
-            await send_clarification_request(field, websocket, text_to_voice, session)
-            return None
-
+       
+        # if is_invalid:
+        #     session['partial_meeting_details'] = combined_details
+        #     logger.info("--- is_valid_time: FAILED - No format matched. Returning False. ---")
+        #     await send_clarification_request(field, websocket, text_to_voice, session)
+        #     return None
+    
    
     # Note: Email validation for attendees is now optional
     # The calendar service will handle attendees gracefully:

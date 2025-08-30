@@ -7,10 +7,15 @@ import time
 
 class SmartAudioProcessor:
     def __init__(self):
-        self.silence_threshold = 0.1
-        self.min_silence_duration = 1.5  
-        self.max_recording_duration = 30  
-        self.min_speech_duration = 0.8   
+        # Lower thresholds for faster detection and processing
+        # RMS threshold tuned for 16kHz PCM16 normalized to [-1, 1]
+        self.silence_threshold = 0.02
+        # Trigger processing sooner after user stops speaking
+        self.min_silence_duration = 0.5
+        # Cap segment length to keep latency low
+        self.max_recording_duration = 8
+        # Allow short commands like "option one"
+        self.min_speech_duration = 0.35
         
         self.audio_buffer = []
         self.last_audio_time = time.time()
@@ -48,12 +53,12 @@ class SmartAudioProcessor:
             
             should_process = (
                 (self.speech_detected and silence_duration >= self.min_silence_duration) or
-                (total_duration >= self.max_recording_duration) or
+                (total_duration >= self.max_recording_duration) or 
                 (self.speech_detected and silence_duration >= 0.8 and total_duration >= 3.0)
             )
             
             if should_process and total_duration >= self.min_speech_duration:
-                print(f"✅ Processing triggered: speech={self.speech_detected}, silence={silence_duration:.1f}s")
+                # print kept off to avoid console I/O latency
                 return True
         
         return False

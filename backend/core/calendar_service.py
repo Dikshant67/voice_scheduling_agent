@@ -10,8 +10,10 @@ from google.oauth2.credentials import Credentials
 import pytz
 from core.validation import is_valid_date, is_valid_time
 from core.timezone_utils import parse_datetime, validate_timezone
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')  # Missing closing parenthesis
+from rapidfuzz import fuzz,process
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
 class CalendarService:
     def __init__(self):
         self.SCOPES = ['https://www.googleapis.com/auth/calendar']
@@ -24,7 +26,13 @@ class CalendarService:
         except Exception as e:
             logger.error(f"Failed to initialize Google Calendar service: {str(e)}")
             raise Exception(f"Failed to initialize Google Calendar service: {str(e)}")
-        
+        # Cached service client
+        self._service = None
+
+    def _get_service(self):
+        if self._service is None:
+            self._service = build('calendar', 'v3', credentials=self.credentials)
+        return self._service
 
     def _get_credentials(self):
         creds = None
@@ -58,22 +66,37 @@ class CalendarService:
             datetime_str = datetime_str[:-1] + '+00:00'
         return datetime.fromisoformat(datetime_str)
 
+
     def has_conflict_with_buffer(self, existing_events, new_start, new_end):
         for event in existing_events:
-            start = event['start'].get('dateTime')
-            end = event['end'].get('dateTime')
-
-            if start and end:
-                existing_start = self._parse_datetime_string(start)
-                existing_end = self._parse_datetime_string(end)
-
-                if existing_start.tzinfo is None or existing_end.tzinfo is None:
-                    raise ValueError("Existing event times must be timezone-aware")
-
-                if not (new_end <= existing_start - timedelta(minutes=self.BUFFER_MINUTES) or
-                        new_start >= existing_end + timedelta(minutes=self.BUFFER_MINUTES)):
-                    return True
-        return False
+            start = event['start'].get('dateTime') or event['start'].get('date')
+            end = event['end'].get('dateTime') or event['end'].get('date')
+    
+            if not start or not end:
+                continue  # skip malformed/all-day events
+    
+            existing_start = self._parse_datetime_string(start)
+            existing_end = self._parse_datetime_string(end)
+    
+            if existing_start.tzinfo is None or existing_end.tzinfo is None:
+                raise ValueError("Existing event times must be timezone-aware")
+    
+            # Normalize to same tz as new_start
+            existing_start = existing_start.astimezone(new_start.tzinfo)
+            existing_end = existing_end.astimezone(new_start.tzinfo)
+    
+            logger.debug(f"Checking conflict: new [{new_start} - {new_end}] "
+                         f"vs existing [{existing_start} - {existing_end}]")
+    
+            overlap = not (
+                new_end <= existing_start - timedelta(minutes=self.BUFFER_MINUTES) or
+                new_start >= existing_end + timedelta(minutes=self.BUFFER_MINUTES)
+            )
+    
+            if overlap:
+                return True
+    
+        return False   
 
     def suggest_next_slot(self, existing_events, desired_start, duration_minutes):
         current = desired_start
@@ -241,35 +264,232 @@ class CalendarService:
         raise ValueError(f"Unable to parse time format: {time_str}")
 
     def schedule_event(self, title, start_dt, end_dt, timezone, attendees=None):
-        service = build('calendar', 'v3', credentials=self.credentials)
+        service = self._get_service()
         try:
             event = {
-            'summary': title,
-            'start': {'dateTime': start_dt.isoformat(), 'timeZone': timezone},
-            'end': {'dateTime': end_dt.isoformat(), 'timeZone': timezone},
-            'attendees': [] # Start with an empty list
+                'summary': title,
+                'start': {'dateTime': start_dt.isoformat(), 'timeZone': timezone},
+                'end': {'dateTime': end_dt.isoformat(), 'timeZone': timezone},
+                'attendees': []  # Start with an empty list
             }
 
-        
-        # We validate each attendee before adding them to the event.
+            # Validate attendees before adding them to the event
             if attendees:
                 valid_attendees = []
                 for email in attendees:
-                # A simple but effective check for a valid email format
                     if isinstance(email, str) and '@' in email:
                         valid_attendees.append({'email': email})
                     else:
                         logger.warning(f"Skipping invalid attendee entry: {email}")
-            
-            if valid_attendees:
-                event['attendees'] = valid_attendees
-        
+                if valid_attendees:
+                    event['attendees'] = valid_attendees
 
             created_event = service.events().insert(calendarId='primary', body=event).execute()
             return created_event
         except Exception as e:
             logger.error(f"Failed to schedule event: {e}", exc_info=True)
             raise e
+
+    # ---- NEW: Cancel / Reschedule helpers ----
+    def _build_day_range(self, date_str: str, timezone: str):
+        tz = pytz.timezone(timezone)
+        start_dt = tz.localize(datetime.strptime(f"{date_str} 00:00", "%Y-%m-%d %H:%M"))
+        end_dt = tz.localize(datetime.strptime(f"{date_str} 23:59", "%Y-%m-%d %H:%M"))
+        return start_dt, end_dt
+
+    def find_event(self, title: str | None, date_str: str, time_str: str | None, timezone: str):
+        """
+        Find the best matching event by title/date/time using fuzzy matching.
+        Returns the best matching event dict or None.
+        """
+        try:
+            if not date_str:
+                raise ValueError("Date is required to find an event")
+
+            tz = pytz.timezone(timezone)
+
+            # Build search window based on given date and time
+            if time_str:
+                time_24h = self.convert_time_to_24hour(time_str)
+                target_start = tz.localize(datetime.strptime(f"{date_str} {time_24h}", "%Y-%m-%d %H:%M"))
+                window_start = target_start - timedelta(hours=12)
+                window_end = target_start + timedelta(hours=12)
+            else:
+                window_start = tz.localize(datetime.strptime(f"{date_str} 00:00", "%Y-%m-%d %H:%M"))
+                window_end = tz.localize(datetime.strptime(f"{date_str} 23:59", "%Y-%m-%d %H:%M"))
+                target_start = window_start
+
+            # Fetch events in that window
+            events = self.fetch_existing_events(window_start, window_end, timezone)
+            if not events:
+                return None
+
+            # If no title given, pick event closest to requested time
+            if not title or not title.strip():
+                closest_event = min(
+                    events,
+                    key=lambda e: abs(
+                        (self._parse_datetime_string(e['start']['dateTime']) - target_start).total_seconds()
+                    )
+                )
+                return closest_event
+
+            # Normalize title
+            query_title = title.strip().lower()
+
+            # Fuzzy match against event titles
+            scored_events = []
+            for e in events:
+                e_title = (e.get('summary') or e.get('title') or "").strip()
+                if not e_title:
+                    continue
+                score = fuzz.ratio(query_title, e_title.lower())
+                scored_events.append((score, e))
+
+            if not scored_events:
+                return None
+
+            # Sort by best fuzzy score first, then by time proximity
+            scored_events.sort(
+                key=lambda tup: (
+                    -tup[0],  # highest score first
+                    abs((self._parse_datetime_string(tup[1]['start']['dateTime']) - target_start).total_seconds())
+                )
+            )
+
+            best_score, best_event = scored_events[0]
+
+            # Confidence threshold
+            if best_score >= 75:
+                return best_event
+            else:
+                logger.warning(
+                    f"Low confidence match ({best_score}%) for title '{title}' -> "
+                    f"matched with '{best_event.get('summary','')}'"
+                )
+                return best_event  # still return, but caller should confirm with user
+
+        except Exception as e:
+            logger.error(f"Error finding event: {e}", exc_info=True)
+            return None    
+    def cancel_event_by_id(self, event_id: str) -> bool:
+        try:
+            service = self._get_service()
+            service.events().delete(calendarId='primary', eventId=event_id).execute()
+            return True
+        except Exception as e:
+            logger.error(f"Failed to cancel event {event_id}: {e}", exc_info=True)
+            return False
+
+    def find_event_flexible(self, title: str | None, date_str: str | None, time_str: str | None, timezone: str):
+        """
+        Flexible finder:
+        - If date is provided, delegate to find_event (time optional, title optional)
+        - If date is missing:
+            - If title provided: search next 30 days and pick the best fuzzy match, preferring upcoming
+            - If no title but time provided: search today for closest time, otherwise pick next upcoming
+        Returns event dict or None.
+        """
+        try:
+            tz = pytz.timezone(timezone)
+            now_tz = datetime.now(tz)
+
+            if date_str:
+                return self.find_event(title, date_str, time_str, timezone)
+
+            # Determine window when date is not supplied: now to +30 days
+            window_start = now_tz
+            window_end = now_tz + timedelta(days=30)
+            events = self.fetch_existing_events(window_start, window_end, timezone)
+            if not events:
+                return None
+
+            # Helper to get event start in tz
+            def ev_start(e):
+                return self._parse_datetime_string(e['start']['dateTime']).astimezone(tz)
+
+            # If title is provided, fuzzy match across window
+            if title and title.strip():
+                query_title = title.strip().lower()
+                scored = []
+                for e in events:
+                    e_title = (e.get('summary') or e.get('title') or '').strip()
+                    if not e_title:
+                        continue
+                    score = fuzz.ratio(query_title, e_title.lower())
+                    # Prefer soonest upcoming when scores tie
+                    scored.append((score, ev_start(e), e))
+                if not scored:
+                    return None
+                scored.sort(key=lambda t: (-t[0], t[1]))
+                best = scored[0]
+                return best[2]
+
+            # No title. If time is provided, pick closest time today (or next day) to requested time
+            if time_str:
+                try:
+                    t24 = self.convert_time_to_24hour(time_str)
+                    target_today = tz.localize(datetime.strptime(f"{now_tz.strftime('%Y-%m-%d')} {t24}", "%Y-%m-%d %H:%M"))
+                except Exception:
+                    target_today = now_tz
+                # Choose event with start closest to target_today but in future
+                future_events = [e for e in events if ev_start(e) >= now_tz]
+                if not future_events:
+                    return None
+                closest = min(future_events, key=lambda e: abs((ev_start(e) - target_today).total_seconds()))
+                return closest
+
+            # Neither title nor time: choose next upcoming event
+            future_events = [e for e in events if ev_start(e) >= now_tz]
+            if not future_events:
+                return None
+            future_events.sort(key=lambda e: ev_start(e))
+            return future_events[0]
+        except Exception as e:
+            logger.error(f"Error in find_event_flexible: {e}", exc_info=True)
+            return None
+
+    def cancel_event(self, title: str | None, date: str | None, time: str | None, timezone: str) -> dict:
+        ev = self.find_event(title, date, time, timezone) if date else self.find_event_flexible(title, date, time, timezone)
+        if not ev:
+            return {"status": "not_found", "message": "Could not find a matching event to cancel."}
+        ev_id = ev.get('id') or ev.get('eventId')
+        if not ev_id:
+            return {"status": "error", "message": "Event found but missing id."}
+        ok = self.cancel_event_by_id(ev_id)
+        if not ok:
+            return {"status": "error", "message": "Failed to cancel the event."}
+        return {"status": "cancelled", "event": ev}
+
+    def reschedule_event_by_id(self, event_id: str, new_start_dt: datetime, new_end_dt: datetime, timezone: str) -> dict:
+        try:
+            service = self._get_service()
+            body = {
+                'start': {'dateTime': new_start_dt.isoformat(), 'timeZone': timezone},
+                'end': {'dateTime': new_end_dt.isoformat(), 'timeZone': timezone},
+            }
+            updated = service.events().patch(calendarId='primary', eventId=event_id, body=body).execute()
+            return {"status": "rescheduled", "event": updated}
+        except Exception as e:
+            logger.error(f"Failed to reschedule event {event_id}: {e}", exc_info=True)
+            return {"status": "error", "message": str(e)}
+
+    def reschedule_event(self, title: str | None, date: str | None, time: str | None, timezone: str, new_date: str, new_time: str) -> dict:
+        ev = self.find_event(title, date, time, timezone) if date else self.find_event_flexible(title, date, time, timezone)
+        if not ev:
+            return {"status": "not_found", "message": "Could not find a matching event to reschedule."}
+        ev_id = ev.get('id') or ev.get('eventId')
+        if not ev_id:
+            return {"status": "error", "message": "Event found but missing id."}
+        try:
+            new_time_24 = self.convert_time_to_24hour(new_time)
+            tz = pytz.timezone(timezone)
+            new_start = tz.localize(datetime.strptime(f"{new_date} {new_time_24}", "%Y-%m-%d %H:%M"))
+            new_end = new_start + timedelta(minutes=self.DEFAULT_MEETING_DURATION)
+        except Exception as e:
+            return {"status": "error", "message": f"Invalid new date/time: {e}"}
+
+        return self.reschedule_event_by_id(ev_id, new_start, new_end, timezone)
 
     def intelligent_schedule_handler(self, gpt_data):
         title = gpt_data.get('title')
@@ -471,7 +691,7 @@ class CalendarService:
             timeMax=end_dt.isoformat(),
             singleEvents=True,
             orderBy='startTime',
-            fields="items(summary,start(dateTime),end(dateTime))"
+            fields=f"items(summary,start(dateTime),end(dateTime))"
             ).execute()
 
             return events_result.get('items', [])
@@ -497,6 +717,7 @@ class CalendarService:
                 start_time_aware = parser.parse(event['start']['dateTime'])
                 end_time_aware = parser.parse(event['end']['dateTime'])
                 processed_event = {
+                'id': event.get('id', ''),
                 'title': event.get('summary', 'No Title'),
                 'description': event.get('description', ''),
                 'location': event.get('location', ''),
@@ -521,4 +742,42 @@ class CalendarService:
             logger.error(f"Error in get_availability: {e}", exc_info=True)
         # Return empty list in case of error
             return []
+
+    def list_meetings_for_day(self, date: str, timezone: str):
+        """
+        Returns a simplified list of meetings for the given date in the user's timezone.
+        Output items include: id, title, start_local, end_local.
+        """
+        try:
+            validate_timezone(timezone)
+            tz = pytz.timezone(timezone)
+            start_dt = tz.localize(datetime.strptime(f"{date} 00:00", "%Y-%m-%d %H:%M"))
+            end_dt = tz.localize(datetime.strptime(f"{date} 23:59", "%Y-%m-%d %H:%M"))
+            events = self.fetch_existing_events(start_dt, end_dt, timezone)
+
+            items = []
+            for e in events:
+                st = parser.parse(e['start']['dateTime']).astimezone(tz)
+                en = parser.parse(e['end']['dateTime']).astimezone(tz)
+                items.append({
+                    'id': e.get('id', ''),
+                    'title': e.get('summary', 'No Title'),
+                    'start_local': st.strftime("%Y-%m-%d %H:%M"),
+                    'end_local': en.strftime("%Y-%m-%d %H:%M"),
+                })
+            return items
+        except Exception as e:
+            logger.error(f"Error listing meetings for day: {e}", exc_info=True)
+            return []
+
+    def format_meetings_day_speech(self, items: list, timezone: str) -> str:
+        """
+        Builds a concise natural-language summary for TTS.
+        """
+        if not items:
+            return "You have no meetings scheduled for that day."
+        lines = []
+        for idx, it in enumerate(items, start=1):
+            lines.append(f"{idx}. {it['title']} from {it['start_local'].split(' ')[1]} to {it['end_local'].split(' ')[1]}.")
+        return "Here are your meetings: " + " ".join(lines)
 
